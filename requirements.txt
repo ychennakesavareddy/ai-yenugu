@@ -34,7 +34,7 @@ tenacity==8.2.2
 httpx==0.24.0
 openai==0.27.8
 replicate==1.0.4
-tiktoken==0.4.1
+tiktoken==0.5.2
 
 # Lightweight ML (CPU-only)
 sentencepiece==0.1.98

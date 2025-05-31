@@ -1,0 +1,14 @@
+.env
+*.pyc
+__pycache__/
+instance/
+.DS_Store
+*.swp
+*.swo
+*.log
+*.sqlite
+*.key
+*.pem
+*.json
+.flask_session/
+app.log

@@ -10,7 +10,7 @@ uvicorn==0.23.1
 
 # Firebase & Google Services
 firebase-admin==6.6.0
-google-cloud-firestore==2.13.0
+google-cloud-firestore==2.19.0
 google-auth==2.20.0
 google-api-python-client==2.97.0
 

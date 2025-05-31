@@ -1,14 +1,49 @@
-.env
-*.pyc
+# Python
 __pycache__/
+*.py[cod]
+*.so
+.Python
+
+# Virtual environment
+venv/
+ENV/
+env/
+
+# Flask
 instance/
-.DS_Store
-*.swp
-*.swo
+.flask_session/
+
+# Logs and databases
 *.log
 *.sqlite
+app.log
+
+# Environment files
+.env
+.env.local
+
+# Secrets
 *.key
 *.pem
 *.json
-.flask_session/
-app.log
+secrets/
+
+# IDE and editor
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# System files
+.DS_Store
+Thumbs.db
+
+# Build and test
+build/
+dist/
+*.egg-info/
+.coverage
+htmlcov/
+
+# Render specific
+.render/

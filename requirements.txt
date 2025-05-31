@@ -1,6 +1,6 @@
 # Core Flask & Web
 Flask==3.1.1
-Flask-Cors==3.1.1
+Flask-Cors==3.0.10
 Flask-Session==0.4.0
 Flask-SocketIO==5.3.2
 Werkzeug==2.3.7

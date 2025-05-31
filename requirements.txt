@@ -12,6 +12,7 @@ uvicorn==0.23.1
 firebase-admin==6.6.0
 google-cloud-firestore==2.19.0
 google-auth==2.20.0
+google-auth-oauthlib==1.2.0
 google-api-python-client==2.97.0
 
 # Database & Storage

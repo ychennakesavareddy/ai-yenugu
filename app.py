@@ -30,31 +30,17 @@ load_dotenv()
 # Initialize Flask app
 app = Flask(__name__)
 
-# Enhanced CORS Configuration
-CORS_CONFIG = {
-    r"/api/*": {
-        "origins": [
-            "https://ai-yenugu.netlify.app",
-            "http://localhost:3000",
-            "https://ai-yenugu.onrender.com"
-        ],
-        "methods": ["GET", "POST", "PUT", "DELETE", "OPTIONS"],
-        "allow_headers": ["Content-Type", "Authorization"],
-        "supports_credentials": True,
-        "expose_headers": ["Content-Type"],
-        "max_age": 600
-    }
-}
-CORS(app, resources=CORS_CONFIG)
-
 # Application Configuration
 app.secret_key = os.getenv("FLASK_SECRET_KEY", secrets.token_hex(32))
+
+# Session Configuration (MUST come before Session initialization)
 app.config.update({
     'SESSION_TYPE': 'filesystem',
-    'SESSION_COOKIE_SAMESITE': 'Lax',
+    'SESSION_FILE_DIR': './.flask_session/',
+    'SESSION_COOKIE_NAME': 'ai_yenugu_session',
     'SESSION_COOKIE_SECURE': os.getenv('FLASK_ENV') == 'production',
     'SESSION_COOKIE_HTTPONLY': True,
-    'SESSION_FILE_DIR': './.flask_session/',
+    'SESSION_COOKIE_SAMESITE': 'Lax',
     'PERMANENT_SESSION_LIFETIME': datetime.timedelta(hours=24),
     'ALLOWED_EXTENSIONS': {'png', 'jpg', 'jpeg', 'gif', 'webp'},
     'MAX_AVATAR_SIZE': 2 * 1024 * 1024,
@@ -69,8 +55,26 @@ app.config.update({
     }
 })
 
-# Initialize session and rate limiter
+# Initialize session (AFTER config)
 Session(app)
+
+# Enhanced CORS Configuration
+CORS(app, resources={
+    r"/api/*": {
+        "origins": [
+            "https://ai-yenugu.netlify.app",
+            "http://localhost:3000",
+            "https://ai-yenugu.onrender.com"
+        ],
+        "methods": ["GET", "POST", "PUT", "DELETE", "OPTIONS"],
+        "allow_headers": ["Content-Type", "Authorization"],
+        "supports_credentials": True,
+        "expose_headers": ["Content-Type"],
+        "max_age": 600
+    }
+})
+
+# Initialize rate limiter
 limiter = Limiter(
     app=app,
     key_func=get_remote_address,
@@ -105,6 +109,23 @@ COHERE_API_URL = "https://api.cohere.ai/v1/chat"
 DEFAULT_CHAT_TITLE = "New Chat"
 MAX_CHAT_MESSAGE_LENGTH = 5000
 MAX_CHAT_TITLE_LENGTH = 100
+
+# Middleware to handle cookies and CORS
+@app.after_request
+def after_request(response):
+    # Add CORS headers
+    response.headers.add('Access-Control-Allow-Credentials', 'true')
+    
+    # Ensure session cookie is properly set
+    if 'ai_yenugu_session' in session:
+        response.set_cookie(
+            'ai_yenugu_session',
+            value=session.sid,
+            secure=app.config['SESSION_COOKIE_SECURE'],
+            httponly=True,
+            samesite='Lax'
+        )
+    return response
 
 # Helper Functions
 def requires_drive_connection(f):

@@ -14,6 +14,8 @@ from werkzeug.utils import secure_filename
 from flask import Flask, request, jsonify, session, Response, send_file
 from flask_cors import CORS
 from flask_session import Session
+from flask_limiter import Limiter
+from flask_limiter.util import get_remote_address
 from google.oauth2.credentials import Credentials
 from google_auth_oauthlib.flow import Flow
 from googleapiclient.discovery import build
@@ -32,8 +34,9 @@ app = Flask(__name__)
 CORS_CONFIG = {
     r"/api/*": {
         "origins": [
-            "https://ai-yenugu.netlify.app",  # Production frontend
-            "http://localhost:3000"           # Development frontend
+            "https://ai-yenugu.netlify.app",
+            "http://localhost:3000",
+            "https://ai-yenugu.onrender.com"
         ],
         "methods": ["GET", "POST", "PUT", "DELETE", "OPTIONS"],
         "allow_headers": ["Content-Type", "Authorization"],
@@ -54,15 +57,25 @@ app.config.update({
     'SESSION_FILE_DIR': './.flask_session/',
     'PERMANENT_SESSION_LIFETIME': datetime.timedelta(hours=24),
     'ALLOWED_EXTENSIONS': {'png', 'jpg', 'jpeg', 'gif', 'webp'},
-    'MAX_AVATAR_SIZE': 2 * 1024 * 1024,  # 2MB
-    'COHERE_TIMEOUT': 30,  # seconds
-    'GOOGLE_OAUTH_CACHE_TIMEOUT': 300,  # 5 minutes
-    'MAX_CONTENT_LENGTH': 16 * 1024 * 1024,  # 16MB max upload size
-    'CHAT_HISTORY_LIMIT': 50  # Max number of chats to keep in memory
+    'MAX_AVATAR_SIZE': 2 * 1024 * 1024,
+    'COHERE_TIMEOUT': 30,
+    'GOOGLE_OAUTH_CACHE_TIMEOUT': 300,
+    'MAX_CONTENT_LENGTH': 16 * 1024 * 1024,
+    'CHAT_HISTORY_LIMIT': 50,
+    'RATE_LIMIT': {
+        'ENABLED': os.getenv('RATE_LIMIT_ENABLED', 'false').lower() == 'true',
+        'REQUESTS': 100,
+        'PERIOD': 60
+    }
 })
 
-# Initialize session
+# Initialize session and rate limiter
 Session(app)
+limiter = Limiter(
+    app=app,
+    key_func=get_remote_address,
+    default_limits=["200 per day", "50 per hour"] if app.config['RATE_LIMIT']['ENABLED'] else []
+)
 
 # Configure logging
 logging.basicConfig(
@@ -122,7 +135,6 @@ def handle_api_errors(f):
     return decorated_function
 
 def validate_chat_message(message):
-    """Validate and sanitize chat message"""
     if not message or not isinstance(message, str):
         raise ValueError("Message must be a non-empty string")
     message = message.strip()
@@ -131,7 +143,6 @@ def validate_chat_message(message):
     return message
 
 def validate_chat_title(title):
-    """Validate and sanitize chat title"""
     if not title or not isinstance(title, str):
         raise ValueError("Title must be a non-empty string")
     title = title.strip()
@@ -141,8 +152,6 @@ def validate_chat_title(title):
 
 # Service Classes
 class DriveManager:
-    """Handles all Google Drive operations with improved error handling and retries"""
-    
     @staticmethod
     @retry(
         stop=stop_after_attempt(3),
@@ -150,7 +159,6 @@ class DriveManager:
         retry=retry_if_exception_type(HttpError)
     )
     def get_service(credentials):
-        """Returns a configured Drive service instance with token refresh"""
         creds = Credentials(
             token=credentials['token'],
             refresh_token=credentials['refresh_token'],
@@ -174,7 +182,6 @@ class DriveManager:
         retry=retry_if_exception_type(HttpError)
     )
     def ensure_folder(service, folder_name):
-        """Ensures folder exists and returns its ID"""
         query = f"mimeType='application/vnd.google-apps.folder' and name='{folder_name}' and trashed=false"
         folders = service.files().list(
             q=query, 
@@ -202,7 +209,6 @@ class DriveManager:
         retry=retry_if_exception_type(HttpError)
     )
     def upload_file(service, folder_id, filename, content, mime_type):
-        """Uploads or updates a file in Drive"""
         query = f"name='{filename}' and '{folder_id}' in parents and trashed=false"
         existing_files = service.files().list(
             q=query, 
@@ -230,7 +236,7 @@ class DriveManager:
             ).execute()
         
         return file['id']
-    
+
     @staticmethod
     @retry(
         stop=stop_after_attempt(3),
@@ -238,7 +244,6 @@ class DriveManager:
         retry=retry_if_exception_type(HttpError)
     )
     def download_file(service, folder_id, filename):
-        """Downloads file content from Drive"""
         query = f"name='{filename}' and '{folder_id}' in parents and trashed=false"
         files = service.files().list(
             q=query, 
@@ -258,7 +263,7 @@ class DriveManager:
             status, done = downloader.next_chunk()
         
         return fh.getvalue()
-    
+
     @staticmethod
     @retry(
         stop=stop_after_attempt(3),
@@ -266,7 +271,6 @@ class DriveManager:
         retry=retry_if_exception_type(HttpError)
     )
     def find_avatar_file(service, folder_id):
-        """Finds the user's avatar file in Drive"""
         query = f"name contains '{AVATAR_FILENAME_PREFIX}' and '{folder_id}' in parents and trashed=false"
         files = service.files().list(
             q=query, 
@@ -276,7 +280,7 @@ class DriveManager:
         ).execute().get('files', [])
         
         return files[0] if files else None
-    
+
     @staticmethod
     @retry(
         stop=stop_after_attempt(3),
@@ -284,7 +288,6 @@ class DriveManager:
         retry=retry_if_exception_type(HttpError)
     )
     def delete_file(service, folder_id, filename):
-        """Deletes a file from Drive"""
         query = f"name='{filename}' and '{folder_id}' in parents and trashed=false"
         files = service.files().list(
             q=query, 
@@ -297,7 +300,7 @@ class DriveManager:
         
         service.files().delete(fileId=files[0]['id']).execute()
         return True
-    
+
     @staticmethod
     @retry(
         stop=stop_after_attempt(3),
@@ -305,7 +308,6 @@ class DriveManager:
         retry=retry_if_exception_type(HttpError)
     )
     def delete_all_avatars(service, folder_id):
-        """Deletes all avatar files for a user"""
         query = f"name contains '{AVATAR_FILENAME_PREFIX}' and '{folder_id}' in parents and trashed=false"
         files = service.files().list(
             q=query, 
@@ -321,11 +323,8 @@ class DriveManager:
         return True
 
 class AuthManager:
-    """Handles authentication and user session management"""
-    
     @staticmethod
     def get_flow():
-        """Returns configured OAuth Flow instance"""
         client_config = {
             "web": {
                 "client_id": os.getenv("GOOGLE_CLIENT_ID"),
@@ -352,7 +351,6 @@ class AuthManager:
         retry=retry_if_exception_type(HttpError)
     )
     def get_user_info(credentials):
-        """Gets user info from Google API"""
         creds = Credentials(
             token=credentials['token'],
             refresh_token=credentials['refresh_token'],
@@ -367,7 +365,6 @@ class AuthManager:
     
     @staticmethod
     def auth_error_response(error_type):
-        """Returns standardized auth error response"""
         return f"""
         <html><body><script>
             window.opener.postMessage({{type: 'auth-error', error: '{error_type}'}}, '{FRONTEND_URL}');
@@ -376,11 +373,8 @@ class AuthManager:
         """
 
 class ProfileManager:
-    """Handles user profile operations"""
-    
     @staticmethod
     def validate_profile_data(data):
-        """Validates and sanitizes profile data"""
         required_fields = ['name', 'email']
         validated = {}
         
@@ -396,7 +390,6 @@ class ProfileManager:
     
     @staticmethod
     def get_default_profile(drive_email):
-        """Returns default profile structure"""
         return {
             'name': 'New User',
             'email': drive_email,
@@ -408,28 +401,21 @@ class ProfileManager:
     
     @staticmethod
     def allowed_file(filename):
-        """Check if the file has an allowed extension"""
         return '.' in filename and \
                filename.rsplit('.', 1)[1].lower() in app.config['ALLOWED_EXTENSIONS']
     
     @staticmethod
     def generate_avatar_filename(extension):
-        """Generates a consistent avatar filename"""
         return f"{AVATAR_FILENAME_PREFIX}.{extension}"
 
 class ChatManager:
-    """Handles chat operations and session management"""
-    
     @staticmethod
     def initialize_chat_session():
-        """Initialize chat session if not exists"""
         if 'chat_sessions' not in session:
             session['chat_sessions'] = {}
             session.modified = True
         
-        # Enforce chat history limit
         if len(session['chat_sessions']) > app.config['CHAT_HISTORY_LIMIT']:
-            # Sort chats by creation time and remove oldest ones
             sorted_chats = sorted(
                 session['chat_sessions'].items(),
                 key=lambda x: x[1].get('created_at', '0')
@@ -440,7 +426,6 @@ class ChatManager:
     
     @staticmethod
     def create_chat_message(content, sender="user", error=False):
-        """Creates a standardized chat message"""
         return {
             "id": str(uuid.uuid4()),
             "content": content,
@@ -451,7 +436,6 @@ class ChatManager:
     
     @staticmethod
     def save_chat_to_drive(service, folder_id, chat_id, chat_data):
-        """Saves chat data to Google Drive"""
         DriveManager.upload_file(
             service, folder_id, 
             f"chat_{chat_id}.json",
@@ -461,11 +445,9 @@ class ChatManager:
     
     @staticmethod
     def generate_chat_title(messages):
-        """Generates a title based on chat content"""
         if not messages:
             return DEFAULT_CHAT_TITLE
         
-        # Try to use the first user message as title
         for msg in messages:
             if msg.get('sender') == 'user':
                 content = msg.get('content', '')
@@ -477,7 +459,6 @@ class ChatManager:
 
 # Core Functions
 def is_drive_connected():
-    """Checks if Drive is properly connected with valid credentials"""
     if 'credentials' not in session:
         return False
     
@@ -501,7 +482,6 @@ def is_drive_connected():
     retry=retry_if_exception_type(requests.exceptions.RequestException)
 )
 def generate_cohere_response(message, chat_history=None):
-    """Generates response using Cohere API with retry logic"""
     if not COHERE_API_KEY:
         raise ValueError("Cohere API key is not configured.")
     
@@ -533,7 +513,6 @@ def generate_cohere_response(message, chat_history=None):
             timeout=(10, app.config['COHERE_TIMEOUT'])
         )
         
-        # Handle rate limiting
         if response.status_code == 429:
             retry_after = int(response.headers.get('Retry-After', 5))
             time.sleep(retry_after)
@@ -558,9 +537,9 @@ def generate_cohere_response(message, chat_history=None):
 
 # API Endpoints
 @app.route('/api/drive-login', methods=['GET'])
+@limiter.limit("10 per minute")
 @handle_api_errors
 def drive_login():
-    """Initiates Google Drive OAuth flow with state validation"""
     state = secrets.token_urlsafe(32)
     session['oauth_state'] = state
     session['oauth_state_timestamp'] = time.time()
@@ -578,7 +557,6 @@ def drive_login():
 @app.route('/api/drive-callback', methods=['GET'])
 @handle_api_errors
 def drive_callback():
-    """Handles Google Drive OAuth callback with improved error handling"""
     state = request.args.get('state')
     stored_state = session.get('oauth_state')
     state_timestamp = session.get('oauth_state_timestamp', 0)
@@ -629,7 +607,6 @@ def drive_callback():
 @app.route('/api/auth-status', methods=['GET'])
 @handle_api_errors
 def auth_status():
-    """Returns comprehensive authentication status"""
     if not is_drive_connected():
         return jsonify({
             "authenticated": False,
@@ -673,7 +650,6 @@ def auth_status():
 @requires_drive_connection
 @handle_api_errors
 def profile_handler():
-    """Handles profile data storage and retrieval with avatar support"""
     service = DriveManager.get_service(session['credentials'])
     folder_id = session['drive_folder_id']
     
@@ -739,7 +715,6 @@ def profile_handler():
 @requires_drive_connection
 @handle_api_errors
 def get_avatar():
-    """Returns user avatar image with proper caching headers"""
     service = DriveManager.get_service(session['credentials'])
     folder_id = session['drive_folder_id']
     
@@ -765,9 +740,9 @@ def get_avatar():
     return response
 
 @app.route('/api/chat', methods=['POST'])
+@limiter.limit("30 per minute")
 @handle_api_errors
 def chat():
-    """Standard chat endpoint with improved error handling and Drive sync"""
     data = request.json
     try:
         message = validate_chat_message(data.get('message'))
@@ -790,7 +765,6 @@ def chat():
     session.modified = True
 
     try:
-        # Get the chat history for context (last 10 messages)
         chat_history = session['chat_sessions'][chat_id]["messages"][-10:]
         
         ai_response = generate_cohere_response(message, chat_history)
@@ -798,7 +772,6 @@ def chat():
         ai_message = ChatManager.create_chat_message(ai_response, "ai")
         session['chat_sessions'][chat_id]["messages"].append(ai_message)
         
-        # Update chat title if it's the default one
         if session['chat_sessions'][chat_id]["title"] == DEFAULT_CHAT_TITLE:
             session['chat_sessions'][chat_id]["title"] = ChatManager.generate_chat_title(
                 session['chat_sessions'][chat_id]["messages"]
@@ -825,7 +798,7 @@ def chat():
 
     except Exception as e:
         error_message = ChatManager.create_chat_message(
-            f"Sorry, I couldn't process your request. Please try again later. (Error: {str(e)})",
+            f"Sorry, I couldn't process your request. Please try again later.",
             "system",
             True
         )
@@ -841,14 +814,10 @@ def chat():
 @app.route('/api/chats', methods=['GET'])
 @handle_api_errors
 def list_chats():
-    """Returns a list of all available chats from both session and Drive"""
     chats = []
-
-    # Ensure session has a place for chat_sessions
     session.setdefault('chat_sessions', {})
     ChatManager.initialize_chat_session()
 
-    # Add in-memory chats
     for chat_id, chat_data in session['chat_sessions'].items():
         chats.append({
             "id": chat_id,
@@ -858,7 +827,6 @@ def list_chats():
             "message_count": len(chat_data.get("messages", []))
         })
 
-    # Add Drive chats if connected
     if is_drive_connected():
         try:
             credentials = session.get('credentials')
@@ -883,16 +851,15 @@ def list_chats():
                     try:
                         name = file.get('name', '')
                         if name.startswith('chat_') and name.endswith('.json'):
-                            file_chat_id = name[5:-5]  # Remove 'chat_' prefix and '.json' suffix
+                            file_chat_id = name[5:-5]
 
-                            # Avoid duplicates from memory
                             if not any(c['id'] == file_chat_id for c in chats):
                                 chats.append({
                                     "id": file_chat_id,
                                     "title": f"Chat {file_chat_id[:8]}...",
                                     "created_at": file.get('createdTime'),
                                     "source": "drive",
-                                    "message_count": 0  # Unknown until file is read
+                                    "message_count": 0
                                 })
                     except Exception as e:
                         logger.error(f"Error processing file {file.get('name')}: {str(e)}")
@@ -900,7 +867,6 @@ def list_chats():
         except Exception as e:
             logger.error(f"Error loading chats from Drive: {str(e)}")
 
-    # Sort by created_at (fallback to '0' if missing)
     sorted_chats = sorted(
         chats,
         key=lambda x: x.get('created_at') or '0',
@@ -909,11 +875,9 @@ def list_chats():
 
     return jsonify({"chats": sorted_chats})
 
-
 @app.route('/api/chat/<chat_id>', methods=['GET'])
 @handle_api_errors
 def get_chat(chat_id):
-    """Retrieves a specific chat's messages from either session or Drive"""
     ChatManager.initialize_chat_session()
 
     if chat_id in session['chat_sessions']:
@@ -935,7 +899,6 @@ def get_chat(chat_id):
                 DriveManager.download_file(service, folder_id, f"chat_{chat_id}.json").decode('utf-8')
             )
             
-            # Cache in session for faster future access
             session['chat_sessions'][chat_id] = chat_data
             session.modified = True
             
@@ -960,7 +923,6 @@ def get_chat(chat_id):
 @app.route('/api/chat/<chat_id>', methods=['DELETE'])
 @handle_api_errors
 def delete_chat(chat_id):
-    """Deletes a specific chat from both session and Drive"""
     ChatManager.initialize_chat_session()
     deleted_from = []
 
@@ -989,7 +951,6 @@ def delete_chat(chat_id):
 @app.route('/api/chat/<chat_id>/title', methods=['PUT'])
 @handle_api_errors
 def update_chat_title(chat_id):
-    """Updates the title of a specific chat"""
     try:
         new_title = validate_chat_title(request.json.get('title'))
     except ValueError as e:
@@ -1038,7 +999,6 @@ def update_chat_title(chat_id):
 @app.route('/api/logout', methods=['POST'])
 @handle_api_errors
 def logout():
-    """Comprehensive logout with token revocation"""
     if 'credentials' in session:
         try:
             creds = Credentials(**session['credentials'])
@@ -1056,7 +1016,6 @@ def logout():
 
 @app.route('/api/health', methods=['GET'])
 def health_check():
-    """Comprehensive health check endpoint"""
     status = {
         "status": "healthy",
         "timestamp": datetime.datetime.now().isoformat(),
@@ -1084,21 +1043,16 @@ def health_check():
 
 # Production Server Setup
 if __name__ == '__main__':
-    # Create session directory if it doesn't exist
     if not os.path.exists(app.config['SESSION_FILE_DIR']):
         os.makedirs(app.config['SESSION_FILE_DIR'], exist_ok=True)
     
-    # Development-specific settings
     if os.getenv('FLASK_ENV') != 'production':
         os.environ['OAUTHLIB_INSECURE_TRANSPORT'] = '1'
         app.debug = True
     
     logger.info("Starting Flask server")
     
-    # Run with Gunicorn in production
     if os.getenv('FLASK_ENV') == 'production':
-        # These settings are for Render.com deployment
         app.run(host='0.0.0.0', port=int(os.environ.get('PORT', 5000)))
     else:
-        # Local development
         app.run(host='0.0.0.0', port=5000)

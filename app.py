@@ -163,7 +163,7 @@ def after_request(response):
     try:
         if session and 'sid' in session:
             response.set_cookie(
-                app.config['SESSION_COOKIE_NAME'],
+                SESSION_COOKIE_NAME,
                 value=session.sid,
                 secure=app.config['SESSION_COOKIE_SECURE'],
                 httponly=app.config['SESSION_COOKIE_HTTPONLY'],

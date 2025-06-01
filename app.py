@@ -1,3 +1,23 @@
+"""Basic connection example.
+"""
+
+import redis
+
+r = redis.Redis(
+    host='redis-14356.c252.ap-southeast-1-1.ec2.redns.redis-cloud.com',
+    port=14356,
+    decode_responses=True,
+    username="default",
+    password="6T18RXJsymUjiqNNkEZgVucArLAyi080",
+)
+
+success = r.set('foo', 'bar')
+# True
+
+result = r.get('foo')
+print(result)
+# >>> bar
+
 import os
 import io
 import time
@@ -63,8 +83,8 @@ MAX_CHAT_TITLE_LENGTH = 100
 app.secret_key = os.getenv("FLASK_SECRET_KEY", secrets.token_hex(32))
 app.config.update({
     # Session configuration
-    'SESSION_TYPE': 'filesystem',
-    'SESSION_FILE_DIR': './.flask_session/',
+    'SESSION_TYPE': 'redis',
+    'SESSION_REDIS': r,
     'SESSION_COOKIE_NAME': 'ai_yenugu_session',
     'SESSION_COOKIE_SECURE': os.getenv('FLASK_ENV') == 'production',
     'SESSION_COOKIE_HTTPONLY': True,
@@ -81,9 +101,10 @@ app.config.update({
     'CHAT_HISTORY_LIMIT': 50,
 })
 
-# Initialize Flask-Session
+# Initialize Flask-Session FIRST
 Session(app)
 
+# Then initialize other extensions
 # Enhanced CORS Configuration
 CORS(app, resources={
     r"/api/*": {
@@ -100,24 +121,15 @@ CORS(app, resources={
     }
 })
 
-# Initialize rate limiter with Redis storage for production
+# Initialize rate limiter with Redis storage
 try:
-    if os.getenv('FLASK_ENV') == 'production' and os.getenv('REDIS_URL'):
-        from flask_limiter import RedisStorage
-        limiter = Limiter(
-            app=app,
-            key_func=get_remote_address,
-            storage=RedisStorage(os.getenv('REDIS_URL')),
-            default_limits=["200 per day", "50 per hour"]
-        )
-        logger.info("Using Redis for rate limiting")
-    else:
-        limiter = Limiter(
-            app=app,
-            key_func=get_remote_address,
-            default_limits=["200 per day", "50 per hour"]
-        )
-        logger.info("Using in-memory rate limiting")
+    limiter = Limiter(
+        app=app,
+        key_func=get_remote_address,
+        storage_uri="redis://default:6T18RXJsymUjiqNNkEZgVucArLAyi080@redis-14356.c252.ap-southeast-1-1.ec2.redns.redis-cloud.com:14356",
+        default_limits=["200 per day", "50 per hour"]
+    )
+    logger.info("Using Redis for rate limiting")
 except Exception as e:
     logger.error(f"Error initializing rate limiter: {e}")
     limiter = Limiter(app=app, key_func=get_remote_address)
@@ -131,7 +143,8 @@ def health_check():
         "services": {
             "cohere": bool(COHERE_API_KEY),
             "google_drive": bool(os.getenv("GOOGLE_CLIENT_ID")),
-            "session": True
+            "session": True,
+            "redis": True
         }
     })
 
@@ -147,7 +160,7 @@ def after_request(response):
     
     # Only try to set cookies if we have an active session
     try:
-        if session and hasattr(session, 'sid'):
+        if session and 'sid' in session:
             response.set_cookie(
                 app.config['SESSION_COOKIE_NAME'],
                 value=session.sid,
@@ -1071,10 +1084,6 @@ def logout():
 
 # Production Server Setup
 if __name__ == '__main__':
-    # Create session directory if it doesn't exist
-    if not os.path.exists(app.config['SESSION_FILE_DIR']):
-        os.makedirs(app.config['SESSION_FILE_DIR'], exist_ok=True)
-    
     # Development settings
     if os.getenv('FLASK_ENV') != 'production':
         os.environ['OAUTHLIB_INSECURE_TRANSPORT'] = '1'

@@ -24,64 +24,10 @@ from googleapiclient.errors import HttpError
 import requests
 from tenacity import retry, stop_after_attempt, wait_exponential, retry_if_exception_type
 
-# Load environment variables
+# Load environment variables first
 load_dotenv()
 
-# Initialize Flask app
-app = Flask(__name__)
-
-# Application Configuration
-app.secret_key = os.getenv("FLASK_SECRET_KEY", secrets.token_hex(32))
-
-# Session Configuration (MUST come before Session initialization)
-app.config.update({
-    'SESSION_TYPE': 'filesystem',
-    'SESSION_FILE_DIR': './.flask_session/',
-    'SESSION_COOKIE_NAME': 'ai_yenugu_session',
-    'SESSION_COOKIE_SECURE': os.getenv('FLASK_ENV') == 'production',
-    'SESSION_COOKIE_HTTPONLY': True,
-    'SESSION_COOKIE_SAMESITE': 'Lax',
-    'PERMANENT_SESSION_LIFETIME': datetime.timedelta(hours=24),
-    'ALLOWED_EXTENSIONS': {'png', 'jpg', 'jpeg', 'gif', 'webp'},
-    'MAX_AVATAR_SIZE': 2 * 1024 * 1024,
-    'COHERE_TIMEOUT': 30,
-    'GOOGLE_OAUTH_CACHE_TIMEOUT': 300,
-    'MAX_CONTENT_LENGTH': 16 * 1024 * 1024,
-    'CHAT_HISTORY_LIMIT': 50,
-    'RATE_LIMIT': {
-        'ENABLED': os.getenv('RATE_LIMIT_ENABLED', 'false').lower() == 'true',
-        'REQUESTS': 100,
-        'PERIOD': 60
-    }
-})
-
-# Initialize session (AFTER config)
-Session(app)
-
-# Enhanced CORS Configuration
-CORS(app, resources={
-    r"/api/*": {
-        "origins": [
-            "https://ai-yenugu.netlify.app",
-            "http://localhost:3000",
-            "https://ai-yenugu.onrender.com"
-        ],
-        "methods": ["GET", "POST", "PUT", "DELETE", "OPTIONS"],
-        "allow_headers": ["Content-Type", "Authorization"],
-        "supports_credentials": True,
-        "expose_headers": ["Content-Type"],
-        "max_age": 600
-    }
-})
-
-# Initialize rate limiter
-limiter = Limiter(
-    app=app,
-    key_func=get_remote_address,
-    default_limits=["200 per day", "50 per hour"] if app.config['RATE_LIMIT']['ENABLED'] else []
-)
-
-# Configure logging
+# Configure logging before anything else
 logging.basicConfig(
     level=logging.INFO,
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
@@ -91,6 +37,9 @@ logging.basicConfig(
     ]
 )
 logger = logging.getLogger(__name__)
+
+# Initialize Flask app
+app = Flask(__name__)
 
 # Constants
 SCOPES = [
@@ -110,22 +59,107 @@ DEFAULT_CHAT_TITLE = "New Chat"
 MAX_CHAT_MESSAGE_LENGTH = 5000
 MAX_CHAT_TITLE_LENGTH = 100
 
+# Application Configuration - MUST come before Session initialization
+app.secret_key = os.getenv("FLASK_SECRET_KEY", secrets.token_hex(32))
+app.config.update({
+    # Session configuration
+    'SESSION_TYPE': 'filesystem',
+    'SESSION_FILE_DIR': './.flask_session/',
+    'SESSION_COOKIE_NAME': 'ai_yenugu_session',
+    'SESSION_COOKIE_SECURE': os.getenv('FLASK_ENV') == 'production',
+    'SESSION_COOKIE_HTTPONLY': True,
+    'SESSION_COOKIE_SAMESITE': 'Lax',
+    'PERMANENT_SESSION_LIFETIME': datetime.timedelta(hours=24),
+    
+    # Application settings
+    'ALLOWED_EXTENSIONS': {'png', 'jpg', 'jpeg', 'gif', 'webp'},
+    'MAX_AVATAR_SIZE': 2 * 1024 * 1024,
+    'COHERE_TIMEOUT': 30,
+    'GOOGLE_OAUTH_CACHE_TIMEOUT': 300,
+    'MAX_CONTENT_LENGTH': 16 * 1024 * 1024,
+    'CHAT_HISTORY_LIMIT': 50,
+})
+
+# Initialize Flask-Session
+Session(app)
+
+# Enhanced CORS Configuration
+CORS(app, resources={
+    r"/api/*": {
+        "origins": [
+            "https://ai-yenugu.netlify.app",
+            "http://localhost:3000",
+            "https://ai-yenugu.onrender.com"
+        ],
+        "methods": ["GET", "POST", "PUT", "DELETE", "OPTIONS"],
+        "allow_headers": ["Content-Type", "Authorization"],
+        "supports_credentials": True,
+        "expose_headers": ["Content-Type"],
+        "max_age": 600
+    }
+})
+
+# Initialize rate limiter
+try:
+    if os.getenv('FLASK_ENV') == 'production' and os.getenv('REDIS_URL'):
+        from flask_limiter import RedisStorage
+        limiter = Limiter(
+            app=app,
+            key_func=get_remote_address,
+            storage=RedisStorage(os.getenv('REDIS_URL')),
+            default_limits=["200 per day", "50 per hour"]
+        )
+        logger.info("Using Redis for rate limiting")
+    else:
+        limiter = Limiter(
+            app=app,
+            key_func=get_remote_address,
+            default_limits=["200 per day", "50 per hour"]
+        )
+        logger.info("Using in-memory rate limiting")
+except Exception as e:
+    logger.error(f"Error initializing rate limiter: {e}")
+    limiter = Limiter(app=app, key_func=get_remote_address)
+
 # Middleware to handle cookies and CORS
 @app.after_request
 def after_request(response):
+    # Skip if this is a health check or options request
+    if request.path == '/' or request.method == 'OPTIONS':
+        return response
+        
     # Add CORS headers
     response.headers.add('Access-Control-Allow-Credentials', 'true')
     
-    # Ensure session cookie is properly set
-    if 'ai_yenugu_session' in session:
-        response.set_cookie(
-            'ai_yenugu_session',
-            value=session.sid,
-            secure=app.config['SESSION_COOKIE_SECURE'],
-            httponly=True,
-            samesite='Lax'
-        )
+    # Only try to set cookies if we have an active session
+    try:
+        if session and hasattr(session, 'sid'):
+            response.set_cookie(
+                'ai_yenugu_session',
+                value=session.sid,
+                secure=app.config['SESSION_COOKIE_SECURE'],
+                httponly=True,
+                samesite='Lax',
+                max_age=int(app.config['PERMANENT_SESSION_LIFETIME'].total_seconds())
+            )
+    except Exception as e:
+        logger.error(f"Error setting session cookie: {e}")
+    
     return response
+
+# Health check endpoint (no session required)
+@app.route('/', methods=['GET', 'HEAD'])
+def health_check():
+    status = {
+        "status": "healthy",
+        "timestamp": datetime.datetime.now().isoformat(),
+        "services": {
+            "cohere": bool(COHERE_API_KEY),
+            "google_drive": bool(os.getenv("GOOGLE_CLIENT_ID")),
+            "session": True
+        }
+    }
+    return jsonify(status)
 
 # Helper Functions
 def requires_drive_connection(f):
@@ -1035,45 +1069,18 @@ def logout():
     session.clear()
     return jsonify({"success": True})
 
-@app.route('/api/health', methods=['GET'])
-def health_check():
-    status = {
-        "status": "healthy",
-        "timestamp": datetime.datetime.now().isoformat(),
-        "services": {
-            "cohere": bool(COHERE_API_KEY),
-            "google_drive": bool(os.getenv("GOOGLE_CLIENT_ID")),
-            "session": True
-        },
-        "limits": {
-            "chat_history": app.config['CHAT_HISTORY_LIMIT'],
-            "message_length": MAX_CHAT_MESSAGE_LENGTH,
-            "title_length": MAX_CHAT_TITLE_LENGTH
-        }
-    }
-    
-    if 'credentials' in session:
-        try:
-            service = DriveManager.get_service(session['credentials'])
-            status['services']['google_drive_connected'] = True
-        except Exception as e:
-            status['services']['google_drive_connected'] = False
-            status['services']['google_drive_error'] = str(e)
-    
-    return jsonify(status)
-
 # Production Server Setup
 if __name__ == '__main__':
+    # Create session directory if it doesn't exist
     if not os.path.exists(app.config['SESSION_FILE_DIR']):
         os.makedirs(app.config['SESSION_FILE_DIR'], exist_ok=True)
     
+    # Development settings
     if os.getenv('FLASK_ENV') != 'production':
         os.environ['OAUTHLIB_INSECURE_TRANSPORT'] = '1'
         app.debug = True
     
     logger.info("Starting Flask server")
     
-    if os.getenv('FLASK_ENV') == 'production':
-        app.run(host='0.0.0.0', port=int(os.environ.get('PORT', 5000)))
-    else:
-        app.run(host='0.0.0.0', port=5000)
+    port = int(os.environ.get('PORT', 5000))
+    app.run(host='0.0.0.0', port=port)

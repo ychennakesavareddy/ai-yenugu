@@ -27,6 +27,9 @@ from tenacity import retry, stop_after_attempt, wait_exponential, retry_if_excep
 # Load environment variables first
 load_dotenv()
 
+# Initialize Flask app
+app = Flask(__name__)
+
 # Configure logging before anything else
 logging.basicConfig(
     level=logging.INFO,
@@ -37,9 +40,6 @@ logging.basicConfig(
     ]
 )
 logger = logging.getLogger(__name__)
-
-# Initialize Flask app
-app = Flask(__name__)
 
 # Constants
 SCOPES = [
@@ -70,6 +70,7 @@ app.config.update({
     'SESSION_COOKIE_HTTPONLY': True,
     'SESSION_COOKIE_SAMESITE': 'Lax',
     'PERMANENT_SESSION_LIFETIME': datetime.timedelta(hours=24),
+    'SESSION_PERMANENT': True,
     
     # Application settings
     'ALLOWED_EXTENSIONS': {'png', 'jpg', 'jpeg', 'gif', 'webp'},
@@ -99,7 +100,7 @@ CORS(app, resources={
     }
 })
 
-# Initialize rate limiter
+# Initialize rate limiter with Redis storage for production
 try:
     if os.getenv('FLASK_ENV') == 'production' and os.getenv('REDIS_URL'):
         from flask_limiter import RedisStorage
@@ -121,6 +122,19 @@ except Exception as e:
     logger.error(f"Error initializing rate limiter: {e}")
     limiter = Limiter(app=app, key_func=get_remote_address)
 
+# Health check endpoint (no session required)
+@app.route('/', methods=['GET', 'HEAD'])
+def health_check():
+    return jsonify({
+        "status": "healthy",
+        "timestamp": datetime.datetime.now().isoformat(),
+        "services": {
+            "cohere": bool(COHERE_API_KEY),
+            "google_drive": bool(os.getenv("GOOGLE_CLIENT_ID")),
+            "session": True
+        }
+    })
+
 # Middleware to handle cookies and CORS
 @app.after_request
 def after_request(response):
@@ -135,31 +149,17 @@ def after_request(response):
     try:
         if session and hasattr(session, 'sid'):
             response.set_cookie(
-                'ai_yenugu_session',
+                app.config['SESSION_COOKIE_NAME'],
                 value=session.sid,
                 secure=app.config['SESSION_COOKIE_SECURE'],
-                httponly=True,
-                samesite='Lax',
+                httponly=app.config['SESSION_COOKIE_HTTPONLY'],
+                samesite=app.config['SESSION_COOKIE_SAMESITE'],
                 max_age=int(app.config['PERMANENT_SESSION_LIFETIME'].total_seconds())
             )
     except Exception as e:
         logger.error(f"Error setting session cookie: {e}")
     
     return response
-
-# Health check endpoint (no session required)
-@app.route('/', methods=['GET', 'HEAD'])
-def health_check():
-    status = {
-        "status": "healthy",
-        "timestamp": datetime.datetime.now().isoformat(),
-        "services": {
-            "cohere": bool(COHERE_API_KEY),
-            "google_drive": bool(os.getenv("GOOGLE_CLIENT_ID")),
-            "session": True
-        }
-    }
-    return jsonify(status)
 
 # Helper Functions
 def requires_drive_connection(f):

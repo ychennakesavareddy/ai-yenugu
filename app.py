@@ -1,22 +1,4 @@
-"""Basic connection example.
-"""
-
-import redis
-
-r = redis.Redis(
-    host='redis-14356.c252.ap-southeast-1-1.ec2.redns.redis-cloud.com',
-    port=14356,
-    decode_responses=True,
-    username="default",
-    password="6T18RXJsymUjiqNNkEZgVucArLAyi080",
-)
-
-success = r.set('foo', 'bar')
-# True
-
-result = r.get('foo')
-print(result)
-# >>> bar
+"""AI Yenugu Flask Application with Redis Session Storage"""
 
 import os
 import io
@@ -43,6 +25,7 @@ from googleapiclient.http import MediaIoBaseUpload, MediaIoBaseDownload
 from googleapiclient.errors import HttpError
 import requests
 from tenacity import retry, stop_after_attempt, wait_exponential, retry_if_exception_type
+import redis
 
 # Load environment variables first
 load_dotenv()
@@ -78,14 +61,32 @@ COHERE_API_URL = "https://api.cohere.ai/v1/chat"
 DEFAULT_CHAT_TITLE = "New Chat"
 MAX_CHAT_MESSAGE_LENGTH = 5000
 MAX_CHAT_TITLE_LENGTH = 100
+SESSION_COOKIE_NAME = 'ai_yenugu_session'
 
-# Application Configuration - MUST come before Session initialization
+# Initialize Redis connection
+redis_conn = redis.Redis(
+    host='redis-14356.c252.ap-southeast-1-1.ec2.redns.redis-cloud.com',
+    port=14356,
+    username="default",
+    password="6T18RXJsymUjiqNNkEZgVucArLAyi080",
+    decode_responses=True
+)
+
+# Verify Redis connection
+try:
+    redis_conn.ping()
+    logger.info("Successfully connected to Redis")
+except redis.ConnectionError:
+    logger.error("Failed to connect to Redis")
+    raise
+
+# Application Configuration
 app.secret_key = os.getenv("FLASK_SECRET_KEY", secrets.token_hex(32))
 app.config.update({
     # Session configuration
     'SESSION_TYPE': 'redis',
-    'SESSION_REDIS': r,
-    'SESSION_COOKIE_NAME': 'ai_yenugu_session',
+    'SESSION_REDIS': redis_conn,
+    'SESSION_COOKIE_NAME': SESSION_COOKIE_NAME,
     'SESSION_COOKIE_SECURE': os.getenv('FLASK_ENV') == 'production',
     'SESSION_COOKIE_HTTPONLY': True,
     'SESSION_COOKIE_SAMESITE': 'Lax',
@@ -101,11 +102,10 @@ app.config.update({
     'CHAT_HISTORY_LIMIT': 50,
 })
 
-# Initialize Flask-Session FIRST
+# Initialize Flask-Session
 Session(app)
 
-# Then initialize other extensions
-# Enhanced CORS Configuration
+# Initialize CORS with proper configuration
 CORS(app, resources={
     r"/api/*": {
         "origins": [
@@ -126,8 +126,9 @@ try:
     limiter = Limiter(
         app=app,
         key_func=get_remote_address,
-        storage_uri="redis://default:6T18RXJsymUjiqNNkEZgVucArLAyi080@redis-14356.c252.ap-southeast-1-1.ec2.redns.redis-cloud.com:14356",
-        default_limits=["200 per day", "50 per hour"]
+        storage_uri=f"redis://default:6T18RXJsymUjiqNNkEZgVucArLAyi080@redis-14356.c252.ap-southeast-1-1.ec2.redns.redis-cloud.com:14356",
+        default_limits=["200 per day", "50 per hour"],
+        strategy="fixed-window"
     )
     logger.info("Using Redis for rate limiting")
 except Exception as e:

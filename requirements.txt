@@ -1,12 +1,13 @@
 # Core Flask & Web
 Flask==3.1.1
 Flask-Cors==3.0.10
-Flask-Session==0.4.0
+Flask-Session>=0.5.0        # Must be >=0.5.0 to support Flask 3.x
 Flask-SocketIO==5.3.2
 Werkzeug==3.1.2
 Jinja2==3.1.2
 gunicorn==21.2.0
 uvicorn==0.23.1
+Flask-Limiter==3.5.1
 
 # Firebase & Google Services
 firebase-admin==6.6.0
@@ -46,5 +47,3 @@ nltk==3.8.1
 # Production Dependencies
 protobuf==4.23.4
 pyOpenSSL==23.2.0
-
-Flask-Limiter==3.5.1

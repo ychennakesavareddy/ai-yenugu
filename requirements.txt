@@ -28,7 +28,7 @@ numpy==1.24.4  # Better Linux compatibility
 pandas==2.0.3
 pillow==10.0.1  # Updated for Linux libs
 psutil==5.9.5
-cryptography==41.0.4  # Security update
+cryptography>=41.0.5,<42  # Updated for pyOpenSSL 23.3.0 compatibility
 tenacity==8.2.3
 
 # API Clients (Updated for Linux)

@@ -3,6 +3,7 @@ Flask==2.3.2  # More stable with Flask-Session
 Flask-Cors==3.0.10
 Flask-Session==0.8.0  # Updated for better Redis support
 Flask-SocketIO==5.3.6
+flask-limiter==3.5.1
 Werkzeug==2.3.7  # Pinned to avoid WSGI issues
 Jinja2==3.1.2
 gunicorn==21.2.0

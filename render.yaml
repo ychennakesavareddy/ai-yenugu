@@ -1,0 +1,13 @@
+services:
+  - type: web
+    name: ai-yenugu
+    env: python
+    buildCommand: pip install -r requirements.txt
+    startCommand: gunicorn app:app
+    envVars:
+      - key: FLASK_ENV
+        value: production
+      - key: REDIS_URL
+        fromDatabase:
+          name: redis
+          property: connectionString

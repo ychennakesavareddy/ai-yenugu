@@ -1,4 +1,4 @@
-"""AI Yenugu Flask Application with Redis Session Storage"""
+"""AI Yenugu Flask Application with Redis Session Storage (Updated for Render)"""
 
 import os
 import io
@@ -63,36 +63,36 @@ MAX_CHAT_MESSAGE_LENGTH = 5000
 MAX_CHAT_TITLE_LENGTH = 100
 SESSION_COOKIE_NAME = 'ai_yenugu_session'
 
-# Initialize Redis connection
-redis_conn = redis.Redis(
-    host='redis-14356.c252.ap-southeast-1-1.ec2.redns.redis-cloud.com',
-    port=14356,
-    username="default",
-    password="6T18RXJsymUjiqNNkEZgVucArLAyi080",
-    decode_responses=True
-)
+# Initialize Redis connection (Render-compatible)
+redis_url = os.getenv('REDIS_URL', 'redis://default:6T18RXJsymUjiqNNkEZgVucArLAyi080@redis-14356.c252.ap-southeast-1-1.ec2.redns.redis-cloud.com:14356')
+redis_conn = redis.from_url(redis_url)
 
 # Verify Redis connection
 try:
     redis_conn.ping()
-    logger.info("Successfully connected to Redis")
-except redis.ConnectionError:
-    logger.error("Failed to connect to Redis")
+    logger.info("✅ Successfully connected to Redis")
+except redis.ConnectionError as e:
+    logger.error(f"❌ Failed to connect to Redis: {str(e)}")
     raise
 
 # Application Configuration
 app.secret_key = os.getenv("FLASK_SECRET_KEY", secrets.token_hex(32))
 app.config.update({
-    # Session configuration
-    'SESSION_TYPE': 'redis',
-    'SESSION_REDIS': redis_conn,
+    # Core Flask settings
+    'SECRET_KEY': os.getenv("FLASK_SECRET_KEY", secrets.token_hex(32)),
     'SESSION_COOKIE_NAME': SESSION_COOKIE_NAME,
     'SESSION_COOKIE_SECURE': os.getenv('FLASK_ENV') == 'production',
     'SESSION_COOKIE_HTTPONLY': True,
     'SESSION_COOKIE_SAMESITE': 'Lax',
-    'PERMANENT_SESSION_LIFETIME': datetime.timedelta(hours=24),
+    
+    # Flask-Session configuration
+    'SESSION_TYPE': 'redis',
+    'SESSION_REDIS': redis_conn,
     'SESSION_PERMANENT': True,
-
+    'PERMANENT_SESSION_LIFETIME': datetime.timedelta(hours=24),
+    'SESSION_USE_SIGNER': True,
+    'SESSION_REFRESH_EACH_REQUEST': True,
+    
     # Application settings
     'ALLOWED_EXTENSIONS': {'png', 'jpg', 'jpeg', 'gif', 'webp'},
     'MAX_AVATAR_SIZE': 2 * 1024 * 1024,
@@ -102,7 +102,7 @@ app.config.update({
     'CHAT_HISTORY_LIMIT': 50,
 })
 
-# Initialize Flask-Session (requires Flask-Session >= 0.5.0 for Flask >= 2.3)
+# Initialize Flask-Session (must come after config)
 Session(app)
 
 # Initialize CORS with proper configuration
@@ -126,14 +126,15 @@ try:
     limiter = Limiter(
         app=app,
         key_func=get_remote_address,
-        storage_uri=f"redis://default:6T18RXJsymUjiqNNkEZgVucArLAyi080@redis-14356.c252.ap-southeast-1-1.ec2.redns.redis-cloud.com:14356",
+        storage_uri=redis_url,
         default_limits=["200 per day", "50 per hour"],
-        strategy="fixed-window"
+        strategy="fixed-window",
+        enabled=True
     )
-    logger.info("Using Redis for rate limiting")
+    logger.info("✅ Rate limiter initialized with Redis")
 except Exception as e:
-    logger.error(f"Error initializing rate limiter: {e}")
-    limiter = Limiter(app=app, key_func=get_remote_address)
+    logger.error(f"❌ Error initializing rate limiter: {e}")
+    limiter = Limiter(app=app, key_func=get_remote_address, enabled=False)
 
 @app.route('/', methods=['GET', 'HEAD'])
 def health_check():
@@ -144,7 +145,7 @@ def health_check():
             "cohere": bool(COHERE_API_KEY),
             "google_drive": bool(os.getenv("GOOGLE_CLIENT_ID")),
             "session": True,
-            "redis": True
+            "redis": redis_conn.ping() if redis_conn else False
         }
     })
 
@@ -1068,6 +1069,5 @@ if __name__ == '__main__':
         app.debug = True
 
     logger.info("Starting Flask server")
-
     port = int(os.environ.get('PORT', 5000))
     app.run(host='0.0.0.0', port=port)

@@ -1,5 +1,3 @@
-"""AI Yenugu Flask Application with Redis Session Storage (Updated for Render)"""
-
 import os
 import io
 import time
@@ -84,6 +82,7 @@ app.config.update({
     'SESSION_COOKIE_SECURE': os.getenv('FLASK_ENV') == 'production',
     'SESSION_COOKIE_HTTPONLY': True,
     'SESSION_COOKIE_SAMESITE': 'Lax',
+    'SESSION_COOKIE_DOMAIN': None,
     
     # Flask-Session configuration
     'SESSION_TYPE': 'redis',
@@ -108,18 +107,29 @@ Session(app)
 # Initialize CORS with proper configuration
 CORS(app, resources={
     r"/api/*": {
-        "origins": [
-            "https://ai-yenugu.netlify.app",
-            "http://localhost:3000",
-            "https://ai-yenugu.onrender.com"
-        ],
-        "methods": ["GET", "POST", "PUT", "DELETE", "OPTIONS"],
-        "allow_headers": ["Content-Type", "Authorization"],
+        "origins": ["http://localhost:3000", "https://ai-yenugu.netlify.app"],
         "supports_credentials": True,
-        "expose_headers": ["Content-Type"],
-        "max_age": 600
+        "allow_headers": ["Content-Type", "Authorization"],
+        "methods": ["GET", "POST", "PUT", "DELETE", "OPTIONS"]
     }
 })
+
+@app.after_request
+def after_request(response):
+    # Skip if this is a health check or options request
+    if request.path == '/' or request.method == 'OPTIONS':
+        return response
+
+    # Add CORS headers - ensure no duplicates
+    if 'Access-Control-Allow-Origin' not in response.headers:
+        origin = request.headers.get('Origin', '')
+        if origin in ['http://localhost:3000', 'https://ai-yenugu.netlify.app']:
+            response.headers['Access-Control-Allow-Origin'] = origin
+            response.headers['Access-Control-Allow-Credentials'] = 'true'
+            response.headers['Access-Control-Allow-Methods'] = 'GET, POST, PUT, DELETE, OPTIONS'
+            response.headers['Access-Control-Allow-Headers'] = 'Content-Type, Authorization'
+    
+    return response
 
 # Initialize rate limiter with Redis storage
 try:
@@ -135,29 +145,6 @@ try:
 except Exception as e:
     logger.error(f"❌ Error initializing rate limiter: {e}")
     limiter = Limiter(app=app, key_func=get_remote_address, enabled=False)
-
-@app.route('/', methods=['GET', 'HEAD'])
-def health_check():
-    return jsonify({
-        "status": "healthy",
-        "timestamp": datetime.datetime.now().isoformat(),
-        "services": {
-            "cohere": bool(COHERE_API_KEY),
-            "google_drive": bool(os.getenv("GOOGLE_CLIENT_ID")),
-            "session": True,
-            "redis": redis_conn.ping() if redis_conn else False
-        }
-    })
-
-@app.after_request
-def after_request(response):
-    # Skip if this is a health check or options request
-    if request.path == '/' or request.method == 'OPTIONS':
-        return response
-
-    # Add CORS headers
-    response.headers.add('Access-Control-Allow-Credentials', 'true')
-    return response
 
 def requires_drive_connection(f):
     @wraps(f)
@@ -584,6 +571,19 @@ def generate_cohere_response(message, chat_history=None):
     except Exception as e:
         logger.error(f"Unexpected error in Cohere API call: {str(e)}")
         raise
+
+@app.route('/', methods=['GET', 'HEAD'])
+def health_check():
+    return jsonify({
+        "status": "healthy",
+        "timestamp": datetime.datetime.now().isoformat(),
+        "services": {
+            "cohere": bool(COHERE_API_KEY),
+            "google_drive": bool(os.getenv("GOOGLE_CLIENT_ID")),
+            "session": True,
+            "redis": redis_conn.ping() if redis_conn else False
+        }
+    })
 
 @app.route('/api/drive-login', methods=['GET'])
 @limiter.limit("10 per minute")

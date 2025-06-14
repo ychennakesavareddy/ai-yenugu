@@ -8,12 +8,12 @@ import secrets
 import mimetypes
 import datetime
 import traceback
-from urllib.parse import quote_plus
-from functools import wraps, lru_cache
+from urllib.parse import quote_plus, urlparse, parse_qs
+from functools import wraps
 from concurrent.futures import ThreadPoolExecutor
 from dotenv import load_dotenv
 from werkzeug.utils import secure_filename
-from flask import Flask, request, jsonify, session, Response, send_file
+from flask import Flask, request, jsonify, session, Response, send_file, redirect
 from flask_cors import CORS
 from flask_session import Session
 from flask_limiter import Limiter
@@ -26,7 +26,7 @@ from googleapiclient.errors import HttpError
 import requests
 from tenacity import retry, stop_after_attempt, wait_exponential, retry_if_exception_type
 import redis
-from redis.exceptions import RedisError, ConnectionError as RedisConnectionError
+from redis.exceptions import RedisError
 import msgpack
 
 # Load environment variables first
@@ -35,7 +35,7 @@ load_dotenv()
 # Initialize Flask app
 app = Flask(__name__)
 
-# Configure logging before anything else
+# Configure logging
 logging.basicConfig(
     level=logging.INFO,
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
@@ -67,13 +67,13 @@ SESSION_COOKIE_NAME = 'ai_yenugu_session'
 CACHE_TTL = 3600  # 1 hour cache
 THREAD_POOL_SIZE = 4
 
-# Initialize thread pool for async operations
+# Initialize thread pool
 executor = ThreadPoolExecutor(max_workers=THREAD_POOL_SIZE)
 
-# Redis Configuration with proper error handling
+# Redis Configuration
 def get_redis_connection():
     try:
-        redis_url = os.getenv('REDIS_URL', 'redis://default:6T18RXJsymUjiqNNkEZgVucArLAyi080@redis-14356.c252.ap-southeast-1-1.ec2.redns.redis-cloud.com:14356')
+        redis_url = os.getenv('REDIS_URL', 'redis://localhost:6379')
         redis_conn = redis.Redis.from_url(
             redis_url,
             decode_responses=False,
@@ -82,12 +82,11 @@ def get_redis_connection():
             retry_on_timeout=True,
             max_connections=10
         )
-        redis_conn.ping()  # Test connection
+        redis_conn.ping()
         logger.info("✅ Successfully connected to Redis")
         return redis_conn
     except RedisError as e:
         logger.error(f"❌ Failed to connect to Redis: {str(e)}")
-        # Fallback to in-memory storage if Redis is not available
         logger.warning("Using in-memory storage as fallback")
         return redis.Redis.from_url('memory://')
 
@@ -96,36 +95,30 @@ redis_conn = get_redis_connection()
 # Application Configuration
 app.secret_key = os.getenv("FLASK_SECRET_KEY", secrets.token_hex(32))
 app.config.update({
-    # Core Flask settings
     'SECRET_KEY': os.getenv("FLASK_SECRET_KEY", secrets.token_hex(32)),
     'SESSION_COOKIE_NAME': SESSION_COOKIE_NAME,
     'SESSION_COOKIE_SECURE': os.getenv('FLASK_ENV') == 'production',
     'SESSION_COOKIE_HTTPONLY': True,
     'SESSION_COOKIE_SAMESITE': 'Lax',
-    'SESSION_COOKIE_DOMAIN': None,
     
-    # Flask-Session configuration
     'SESSION_TYPE': 'redis',
     'SESSION_REDIS': redis_conn,
     'SESSION_PERMANENT': True,
     'PERMANENT_SESSION_LIFETIME': datetime.timedelta(hours=24),
     'SESSION_USE_SIGNER': True,
-    'SESSION_REFRESH_EACH_REQUEST': True,
     
-    # Application settings
     'ALLOWED_EXTENSIONS': {'png', 'jpg', 'jpeg', 'gif', 'webp'},
     'MAX_AVATAR_SIZE': 2 * 1024 * 1024,
     'COHERE_TIMEOUT': 30,
-    'GOOGLE_OAUTH_CACHE_TIMEOUT': 300,
     'MAX_CONTENT_LENGTH': 16 * 1024 * 1024,
     'CHAT_HISTORY_LIMIT': 50,
     'JSONIFY_PRETTYPRINT_REGULAR': False,
 })
 
-# Initialize Flask-Session (must come after config)
+# Initialize Flask-Session
 Session(app)
 
-# Initialize CORS with proper configuration
+# Initialize CORS
 CORS(app, resources={
     r"/api/*": {
         "origins": ["http://localhost:3000", "https://ai-yenugu.netlify.app"],
@@ -136,46 +129,36 @@ CORS(app, resources={
     }
 })
 
-# Initialize rate limiter with Redis storage
+# Initialize rate limiter
 try:
     limiter = Limiter(
         app=app,
         key_func=get_remote_address,
         storage_uri=os.getenv('REDIS_URL'),
         default_limits=["200 per day", "50 per hour"],
-        strategy="moving-window",
-        enabled=True
+        strategy="moving-window"
     )
     logger.info("✅ Rate limiter initialized with Redis")
 except Exception as e:
     logger.error(f"❌ Error initializing rate limiter: {e}")
-    limiter = Limiter(
-        app=app,
-        key_func=get_remote_address,
-        storage_uri="memory://",
-        enabled=True
-    )
+    limiter = Limiter(app=app, key_func=get_remote_address, storage_uri="memory://")
 
 @app.after_request
 def after_request(response):
-    # Skip if this is a health check or options request
     if request.path == '/' or request.method == 'OPTIONS':
         return response
 
-    # Add CORS headers
     origin = request.headers.get('Origin', '')
     if origin in ['http://localhost:3000', 'https://ai-yenugu.netlify.app']:
         response.headers['Access-Control-Allow-Origin'] = origin
         response.headers['Access-Control-Allow-Credentials'] = 'true'
     
-    # Add security headers
     response.headers['X-Content-Type-Options'] = 'nosniff'
     response.headers['X-Frame-Options'] = 'SAMEORIGIN'
     response.headers['X-XSS-Protection'] = '1; mode=block'
     
     return response
 
-# Cache decorator with Redis
 def cache_response(ttl=CACHE_TTL, key_prefix='cache'):
     def decorator(f):
         @wraps(f)
@@ -259,7 +242,6 @@ class DriveManager:
     _service_cache = {}
     
     @staticmethod
-    @lru_cache(maxsize=100)
     def get_flow():
         client_config = {
             "web": {
@@ -459,7 +441,6 @@ class DriveManager:
 
         service.files().delete(fileId=files[0]['id']).execute()
         
-        # Clear cache
         cache_key = f"file:{folder_id}:{filename}"
         try:
             redis_conn.delete(cache_key)
@@ -482,7 +463,6 @@ class DriveManager:
         for file in files:
             service.files().delete(fileId=file['id']).execute()
             
-            # Clear cache
             cache_key = f"file:{folder_id}:{file['id']}"
             try:
                 redis_conn.delete(cache_key)
@@ -493,7 +473,6 @@ class DriveManager:
 
 class AuthManager:
     @staticmethod
-    @lru_cache(maxsize=1)
     def get_flow():
         client_config = {
             "web": {
@@ -670,7 +649,7 @@ def generate_cohere_response(message, chat_history=None):
         "model": "command",
         "temperature": 0.7,
         "max_tokens": 1000,
-        "stream": False  # Disable streaming for faster response
+        "stream": False
     }
 
     if chat_history:
@@ -686,7 +665,7 @@ def generate_cohere_response(message, chat_history=None):
             COHERE_API_URL,
             headers=headers,
             json=data,
-            timeout=(5, 15)  # Shorter timeout for faster failover
+            timeout=(5, 15)
         )
 
         if response.status_code == 429:
@@ -711,6 +690,7 @@ def generate_cohere_response(message, chat_history=None):
     except Exception as e:
         logger.error(f"Unexpected error in Cohere API call: {str(e)}")
         raise
+
 @app.route('/', methods=['GET', 'HEAD'])
 def health_check():
     redis_status = False
@@ -767,7 +747,11 @@ def drive_callback():
     session.pop('oauth_state_timestamp', None)
 
     flow = AuthManager.get_flow()
-    flow.fetch_token(authorization_response=request.url)
+    try:
+        flow.fetch_token(authorization_response=request.url)
+    except Exception as e:
+        logger.error(f"Error fetching token: {str(e)}")
+        return AuthManager.auth_error_response("token_fetch_failed")
 
     credentials = flow.credentials
     session['credentials'] = {
@@ -779,21 +763,19 @@ def drive_callback():
         'scopes': credentials.scopes
     }
 
-    def _initialize_drive():
-        try:
-            service = DriveManager.get_service(session['credentials'])
-            session['drive_folder_id'] = DriveManager.ensure_folder(service, CHATS_FOLDER_NAME)
-            user_info = AuthManager.get_user_info(session['credentials'])
-            session['user_info'] = {
-                'email': user_info.get('email', ''),
-                'name': user_info.get('name', ''),
-                'picture': user_info.get('picture', '')
-            }
-            session.modified = True
-        except Exception as e:
-            logger.error(f"Background drive initialization failed: {str(e)}")
-
-    executor.submit(_initialize_drive)
+    try:
+        service = DriveManager.get_service(session['credentials'])
+        session['drive_folder_id'] = DriveManager.ensure_folder(service, CHATS_FOLDER_NAME)
+        user_info = AuthManager.get_user_info(session['credentials'])
+        session['user_info'] = {
+            'email': user_info.get('email', ''),
+            'name': user_info.get('name', ''),
+            'picture': user_info.get('picture', '')
+        }
+        session.modified = True
+    except Exception as e:
+        logger.error(f"Drive initialization failed: {str(e)}")
+        return AuthManager.auth_error_response("drive_init_failed")
 
     return f"""
     <html><body><script>
@@ -815,9 +797,17 @@ def auth_status():
 
     user_info = session.get('user_info', {})
     if not user_info:
-        user_info = AuthManager.get_user_info(session['credentials'])
-        session['user_info'] = user_info
-        session.modified = True
+        try:
+            user_info = AuthManager.get_user_info(session['credentials'])
+            session['user_info'] = user_info
+            session.modified = True
+        except Exception as e:
+            logger.error(f"Error getting user info: {str(e)}")
+            return jsonify({
+                "authenticated": False,
+                "drive_connected": False,
+                "user": None
+            })
 
     has_profile = False
     has_avatar = False

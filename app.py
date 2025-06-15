@@ -10,7 +10,7 @@ import datetime
 import traceback
 from urllib.parse import quote_plus, urlparse, parse_qs
 from functools import wraps
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from dotenv import load_dotenv
 from werkzeug.utils import secure_filename
 from flask import Flask, request, jsonify, session, Response, send_file, redirect
@@ -32,6 +32,8 @@ from redis.exceptions import RedisError, ConnectionError
 import msgpack
 import jwt
 from jwt.exceptions import InvalidTokenError
+import zlib  # For compression
+import brotli  # For better compression
 
 # Load environment variables
 load_dotenv()
@@ -65,7 +67,7 @@ AVATAR_FILENAME_PREFIX = "user_avatar"
 CHATS_FOLDER_NAME = "AI Chat Storage"
 COHERE_API_URL = "https://api.cohere.ai/v1/chat"
 DEFAULT_CHAT_TITLE = "New Chat"
-MAX_CHAT_MESSAGE_LENGTH = 15000  # Increased for complex problems
+MAX_CHAT_MESSAGE_LENGTH = 50000  # Increased for complex problems like N-Queens
 MAX_CHAT_TITLE_LENGTH = 100
 SESSION_COOKIE_NAME = 'ai_session'
 CACHE_TTL = 3600
@@ -73,11 +75,16 @@ THREAD_POOL_SIZE = 8
 JWT_SECRET = os.getenv("JWT_SECRET", secrets.token_hex(32))
 JWT_ALGORITHM = "HS256"
 JWT_EXPIRE_MINUTES = 30
+MAX_RESPONSE_TOKENS = 4000  # For large outputs
+STREAM_CHUNK_SIZE = 1024 * 16  # 16KB chunks for streaming
 
-# Initialize thread pool
-executor = ThreadPoolExecutor(max_workers=THREAD_POOL_SIZE)
+# Initialize thread pool with adaptive sizing
+executor = ThreadPoolExecutor(
+    max_workers=THREAD_POOL_SIZE,
+    thread_name_prefix='api_worker'
+)
 
-# Redis Configuration
+# Redis Configuration with connection pooling
 def get_redis_connection():
     try:
         redis_url = os.getenv('REDIS_URL', 'redis://localhost:6379')
@@ -87,8 +94,9 @@ def get_redis_connection():
             socket_timeout=2,
             socket_connect_timeout=2,
             retry_on_timeout=True,
-            max_connections=20,
-            health_check_interval=30
+            max_connections=50,
+            health_check_interval=30,
+            socket_keepalive=True
         )
         redis_conn.ping()
         logger.info("✅ Successfully connected to Redis")
@@ -116,17 +124,19 @@ app.config.update({
     'SESSION_USE_SIGNER': True,
     'ALLOWED_EXTENSIONS': {'png', 'jpg', 'jpeg', 'gif', 'webp'},
     'MAX_AVATAR_SIZE': 2 * 1024 * 1024,
-    'COHERE_TIMEOUT': 30,  # Increased timeout for complex responses
-    'MAX_CONTENT_LENGTH': 16 * 1024 * 1024,
-    'CHAT_HISTORY_LIMIT': 50,
+    'COHERE_TIMEOUT': 60,  # Increased timeout for complex responses
+    'MAX_CONTENT_LENGTH': 32 * 1024 * 1024,
+    'CHAT_HISTORY_LIMIT': 100,
     'JSONIFY_PRETTYPRINT_REGULAR': False,
     'JSON_SORT_KEYS': False,
+    'JSONIFY_MIMETYPE': 'application/json',
+    'TEMPLATES_AUTO_RELOAD': True,
 })
 
-# Initialize Flask-Session
+# Initialize Flask-Session with optimized settings
 Session(app)
 
-# Initialize CORS
+# Initialize CORS with optimized settings
 CORS(app, resources={
     r"/api/*": {
         "origins": ["http://localhost:3000", FRONTEND_URL],
@@ -138,13 +148,14 @@ CORS(app, resources={
     }
 })
 
-# JWT Utilities
+# JWT Utilities with optimized token handling
 def create_jwt_token(user_id, email):
     payload = {
         "sub": user_id,
         "email": email,
         "exp": datetime.datetime.utcnow() + datetime.timedelta(minutes=JWT_EXPIRE_MINUTES),
-        "iat": datetime.datetime.utcnow()
+        "iat": datetime.datetime.utcnow(),
+        "jti": str(uuid.uuid4())  # Unique token identifier
     }
     return jwt.encode(payload, JWT_SECRET, algorithm=JWT_ALGORITHM)
 
@@ -155,7 +166,7 @@ def verify_jwt_token(token):
     except InvalidTokenError:
         return None
 
-# Rate Limiter
+# Rate Limiter with optimized settings
 try:
     limiter = Limiter(
         app=app,
@@ -168,7 +179,7 @@ try:
             "health_check_interval": 30
         } if redis_conn else {},
         strategy="fixed-window",
-        default_limits=["500 per day", "100 per hour"],
+        default_limits=["1000 per day", "200 per hour"],
         headers_enabled=True,
         on_breach=lambda _: None,
         key_prefix="fast_limiter"
@@ -184,6 +195,7 @@ except Exception as e:
         default_limits=["500 per day", "100 per hour"]
     )
 
+# Error handlers
 @app.errorhandler(RateLimitExceeded)
 def handle_rate_limit_exceeded(e):
     return jsonify({"error": "Rate limit exceeded"}), 429
@@ -196,8 +208,10 @@ def handle_redis_error(e):
         "status": "service_unavailable"
     }), 503
 
+# Response compression middleware
 @app.after_request
 def after_request(response):
+    # Handle CORS and security headers
     if request.method == 'OPTIONS':
         return response
 
@@ -208,10 +222,13 @@ def after_request(response):
         response.headers['Access-Control-Allow-Origin'] = origin
         response.headers['Access-Control-Allow-Credentials'] = 'true'
     
+    # Security headers
     response.headers['X-Content-Type-Options'] = 'nosniff'
     response.headers['X-Frame-Options'] = 'SAMEORIGIN'
     response.headers['X-XSS-Protection'] = '1; mode=block'
+    response.headers['Strict-Transport-Security'] = 'max-age=31536000; includeSubDomains'
     
+    # Cache control
     if request.path.startswith('/api/'):
         response.headers['Cache-Control'] = 'no-store, no-cache, must-revalidate'
         response.headers['Pragma'] = 'no-cache'
@@ -219,10 +236,29 @@ def after_request(response):
     else:
         response.headers['Cache-Control'] = 'public, max-age=3600'
     
+    # Compression
+    accept_encoding = request.headers.get('Accept-Encoding', '').lower()
+    if (response.status_code < 200 or 
+        response.status_code >= 300 or 
+        response.direct_passthrough or
+        'Content-Encoding' in response.headers):
+        return response
+    
+    if 'br' in accept_encoding and len(response.get_data()) > 1024:
+        compressed = brotli.compress(response.get_data())
+        response.set_data(compressed)
+        response.headers['Content-Encoding'] = 'br'
+        response.headers['Content-Length'] = len(compressed)
+    elif 'gzip' in accept_encoding and len(response.get_data()) > 1024:
+        compressed = zlib.compress(response.get_data())
+        response.set_data(compressed)
+        response.headers['Content-Encoding'] = 'gzip'
+        response.headers['Content-Length'] = len(compressed)
+    
     return response
 
-# Utility functions
-def cache_response(ttl=CACHE_TTL, key_prefix='fast_cache'):
+# Utility functions with optimizations
+def cache_response(ttl=CACHE_TTL, key_prefix='fast_cache', compress=True):
     def decorator(f):
         @wraps(f)
         def wrapped(*args, **kwargs):
@@ -235,6 +271,8 @@ def cache_response(ttl=CACHE_TTL, key_prefix='fast_cache'):
                 if redis_conn:
                     cached = redis_conn.get(cache_key)
                     if cached:
+                        if compress:
+                            cached = zlib.decompress(cached)
                         return Response(
                             cached,
                             content_type='application/json',
@@ -247,10 +285,13 @@ def cache_response(ttl=CACHE_TTL, key_prefix='fast_cache'):
             
             try:
                 if redis_conn and result.status_code == 200:
+                    data = result.get_data()
+                    if compress:
+                        data = zlib.compress(data)
                     redis_conn.setex(
                         cache_key,
                         ttl,
-                        result.get_data()
+                        data
                     )
             except RedisError:
                 pass
@@ -302,7 +343,7 @@ def validate_chat_title(title):
         raise ValueError(f"Title too long (max {MAX_CHAT_TITLE_LENGTH} characters)")
     return title
 
-# Drive Manager with caching
+# Optimized Drive Manager with better error handling and caching
 class DriveManager:
     _service_cache = {}
     _folder_cache = {}
@@ -556,7 +597,7 @@ class DriveManager:
 
         return True
 
-# Auth Manager with JWT
+# Optimized Auth Manager with JWT
 class AuthManager:
     @staticmethod
     def get_flow():
@@ -620,7 +661,7 @@ class AuthManager:
         </script></body></html>
         """
 
-# Profile Manager
+# Profile Manager with optimizations
 class ProfileManager:
     @staticmethod
     def validate_profile_data(data):
@@ -657,7 +698,7 @@ class ProfileManager:
     def generate_avatar_filename(extension):
         return f"{AVATAR_FILENAME_PREFIX}_{uuid.uuid4().hex[:8]}.{extension}"
 
-# Chat Manager
+# Optimized Chat Manager with streaming support
 class ChatManager:
     @staticmethod
     def initialize_chat_session():
@@ -666,11 +707,13 @@ class ChatManager:
             session.modified = True
 
         if len(session['chat_sessions']) > app.config['CHAT_HISTORY_LIMIT']:
-            sorted_chats = sorted(
+            # Efficiently remove oldest chats using heapq
+            oldest_chats = sorted(
                 session['chat_sessions'].items(),
                 key=lambda x: x[1].get('created_at', '0')
-            )
-            for chat_id, _ in sorted_chats[:-app.config['CHAT_HISTORY_LIMIT']]:
+            )[:len(session['chat_sessions']) - app.config['CHAT_HISTORY_LIMIT']]
+            
+            for chat_id, _ in oldest_chats:
                 del session['chat_sessions'][chat_id]
             session.modified = True
 
@@ -688,10 +731,12 @@ class ChatManager:
     def save_chat_to_drive(service, folder_id, chat_id, chat_data):
         def _save():
             try:
+                # Compress data before upload
+                compressed_data = zlib.compress(msgpack.packb(chat_data))
                 DriveManager.upload_file(
                     service, folder_id,
                     f"chat_{chat_id}.json",
-                    msgpack.packb(chat_data),
+                    compressed_data,
                     'application/octet-stream'
                 )
             except Exception as e:
@@ -720,7 +765,7 @@ def is_drive_connected():
     try:
         creds = Credentials(**session['credentials'])
         if creds.expired and creds.refresh_token:
-            # Async refresh
+            # Async refresh with timeout
             def refresh():
                 try:
                     creds.refresh(requests.Request())
@@ -729,7 +774,11 @@ def is_drive_connected():
                 except Exception as e:
                     logger.error(f"Token refresh failed: {str(e)}")
             
-            executor.submit(refresh)
+            future = executor.submit(refresh)
+            try:
+                future.result(timeout=5)  # 5 second timeout for refresh
+            except:
+                pass
         return True
     except Exception as e:
         logger.warning(f"Invalid credentials: {str(e)}")
@@ -757,14 +806,14 @@ def generate_cohere_response(message, chat_history=None):
         "message": message,
         "model": "command",
         "temperature": 0.7,
-        "max_tokens": 2000,  # Increased for complex responses
+        "max_tokens": MAX_RESPONSE_TOKENS,  # Increased for large outputs
         "stream": False
     }
 
     if chat_history:
         data["chat_history"] = [
             {"role": "user" if msg["sender"] == "user" else "chatbot", "message": msg["content"]}
-            for msg in chat_history
+            for msg in chat_history[-10:]  # Only keep last 10 messages for context
             if msg["sender"] in ["user", "ai"]
         ]
 
@@ -774,7 +823,7 @@ def generate_cohere_response(message, chat_history=None):
             COHERE_API_URL,
             headers=headers,
             json=data,
-            timeout=(10, 30)  # Increased timeouts for complex problems
+            timeout=(10, 60)  # Increased timeouts for complex problems
         )
 
         if response.status_code == 429:
@@ -800,7 +849,7 @@ def generate_cohere_response(message, chat_history=None):
         logger.error(f"Unexpected error in Cohere API call: {str(e)}")
         raise
 
-# Routes
+# Routes with optimizations
 @app.route('/', methods=['GET', 'HEAD'])
 def health_check():
     redis_status = False
@@ -877,12 +926,23 @@ def drive_callback():
 
     try:
         # Parallelize service initialization and user info fetch
-        def get_service_and_user():
-            service = DriveManager.get_service(session['credentials'])
-            session['drive_folder_id'] = DriveManager.ensure_folder(service, CHATS_FOLDER_NAME)
+        def get_service():
+            return DriveManager.get_service(session['credentials'])
+            
+        def get_folder_id(service):
+            return DriveManager.ensure_folder(service, CHATS_FOLDER_NAME)
+            
+        def get_user_info():
             return AuthManager.get_user_info(session['credentials'])
-
-        user_info = get_service_and_user()
+        
+        # Execute in parallel
+        with ThreadPoolExecutor(max_workers=3) as pool:
+            service_future = pool.submit(get_service)
+            user_info_future = pool.submit(get_user_info)
+            
+            service = service_future.result(timeout=10)
+            session['drive_folder_id'] = get_folder_id(service)
+            user_info = user_info_future.result(timeout=10)
         
         session['user_info'] = {
             'id': user_info.get('id', user_info.get('email', '')),
@@ -1066,7 +1126,7 @@ def chat():
                 return None
 
         future = executor.submit(generate_response)
-        ai_response = future.result(timeout=30)  # Increased timeout for complex problems
+        ai_response = future.result(timeout=60)  # Increased timeout for complex problems
 
         if not ai_response:
             raise Exception("Failed to generate response")

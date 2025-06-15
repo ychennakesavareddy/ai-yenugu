@@ -33,7 +33,6 @@ import msgpack
 import jwt
 from jwt.exceptions import InvalidTokenError
 import zlib  # For compression
-import brotli  # For better compression
 
 # Load environment variables
 load_dotenv()
@@ -236,7 +235,7 @@ def after_request(response):
     else:
         response.headers['Cache-Control'] = 'public, max-age=3600'
     
-    # Compression
+    # Compression (removed brotli support)
     accept_encoding = request.headers.get('Accept-Encoding', '').lower()
     if (response.status_code < 200 or 
         response.status_code >= 300 or 
@@ -244,12 +243,7 @@ def after_request(response):
         'Content-Encoding' in response.headers):
         return response
     
-    if 'br' in accept_encoding and len(response.get_data()) > 1024:
-        compressed = brotli.compress(response.get_data())
-        response.set_data(compressed)
-        response.headers['Content-Encoding'] = 'br'
-        response.headers['Content-Length'] = len(compressed)
-    elif 'gzip' in accept_encoding and len(response.get_data()) > 1024:
+    if 'gzip' in accept_encoding and len(response.get_data()) > 1024:
         compressed = zlib.compress(response.get_data())
         response.set_data(compressed)
         response.headers['Content-Encoding'] = 'gzip'

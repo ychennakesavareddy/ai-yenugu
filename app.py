@@ -235,7 +235,7 @@ def after_request(response):
     else:
         response.headers['Cache-Control'] = 'public, max-age=3600'
     
-    # Compression (removed brotli support)
+    # Compression
     accept_encoding = request.headers.get('Accept-Encoding', '').lower()
     if (response.status_code < 200 or 
         response.status_code >= 300 or 
@@ -800,7 +800,7 @@ def generate_cohere_response(message, chat_history=None):
         "message": message,
         "model": "command",
         "temperature": 0.7,
-        "max_tokens": MAX_RESPONSE_TOKENS,  # Increased for large outputs
+        "max_tokens": MAX_RESPONSE_TOKENS,
         "stream": False
     }
 

@@ -57,7 +57,7 @@ SCOPES = [
     "https://www.googleapis.com/auth/userinfo.email",
     "openid"
 ]
-REDIRECT_URI = os.getenv("REDIRECT_URI", "https://your-app.onrender.com/api/drive-callback")
+REDIRECT_URI = os.getenv("REDIRECT_URI", "https://ai-yenugu.onrender.com/api/drive-callback")
 FRONTEND_URL = os.getenv("FRONTEND_URL", "http://localhost:3000")
 COHERE_API_KEY = os.getenv("COHERE_API_KEY")
 PROFILE_FILENAME = "user_profile.json"

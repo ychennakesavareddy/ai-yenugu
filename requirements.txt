@@ -1,53 +1,54 @@
-# Core Flask & Web (Updated for Render compatibility)
-Flask==2.3.2  # More stable with Flask-Session
+# Core Flask & Web
+Flask==2.3.2
 Flask-Cors==3.0.10
-Flask-Session==0.8.0  # Updated for better Redis support
+Flask-Session==0.8.0
 Flask-SocketIO==5.3.6
 flask-limiter==3.5.1
-Werkzeug==2.3.7  # Pinned to avoid WSGI issues
+Werkzeug==2.3.7
 Jinja2==3.1.2
 gunicorn==21.2.0
 uvicorn==0.23.0
+PyJWT>=2.3.0
 
-# Firebase & Google Services (Updated versions)
+# Firebase & Google Services
 firebase-admin==6.2.0
-google-cloud-firestore==2.13.0  # LTS version
+google-cloud-firestore==2.13.0
 google-auth==2.23.3
 google-auth-oauthlib==1.1.0
 google-api-python-client==2.104.0
 
-# Database & Storage (Linux-compatible versions)
+# Database & Storage
 PyMySQL==1.1.0
-redis==4.6.0  # Better async support
+redis==4.6.0
 sqlalchemy==2.0.23
 google-cloud-storage==2.10.0
 
-# Essential Utilities (Stable versions)
+# Essential Utilities
 python-dotenv==1.0.0
 requests==2.31.0
-numpy==1.24.4  # Better Linux compatibility
+numpy==1.24.4
 pandas==2.0.3
-pillow==10.0.1  # Updated for Linux libs
+pillow==10.0.1
 psutil==5.9.5
-cryptography>=41.0.5,<42  # Updated for pyOpenSSL 23.3.0 compatibility
+cryptography>=41.0.5,<42
 tenacity==8.2.3
 
-# API Clients (Updated for Linux)
+# API Clients
 httpx==0.25.0
-openai==1.3.6  # Modern version
+openai==1.3.6
 replicate==0.11.0
 tiktoken==0.5.1
 
-# Lightweight ML (CPU-only Linux versions)
+# Lightweight ML
 sentencepiece==0.1.99
 tokenizers==0.14.1
-scikit-learn==1.3.1  # Patched version
+scikit-learn==1.3.1
 nltk==3.8.1
 
-# Production Dependencies (Security updates)
-protobuf==4.24.4  # Required version for Linux
+# Production Dependencies
+protobuf==4.24.4
 pyOpenSSL==23.3.0
 
-# Additional Render-specific requirements
-greenlet==2.0.2  # Required for async
-gevent==22.10.2  # Better worker compatibility
+# Render-specific
+greenlet==2.0.2
+gevent==22.10.2

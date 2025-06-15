@@ -8,14 +8,18 @@ import secrets
 import mimetypes
 import datetime
 import traceback
+from urllib.parse import quote_plus, urlparse, parse_qs
 from functools import wraps
+from concurrent.futures import ThreadPoolExecutor
 from dotenv import load_dotenv
 from werkzeug.utils import secure_filename
-from flask import Flask, request, jsonify, session, Response, send_file
+from flask import Flask, request, jsonify, session, Response, send_file, redirect
 from flask_cors import CORS
 from flask_session import Session
 from flask_limiter import Limiter
 from flask_limiter.util import get_remote_address
+from flask_limiter.errors import RateLimitExceeded
+from limits.storage import MemoryStorage
 from google.oauth2.credentials import Credentials
 from google_auth_oauthlib.flow import Flow
 from googleapiclient.discovery import build
@@ -24,14 +28,18 @@ from googleapiclient.errors import HttpError
 import requests
 from tenacity import retry, stop_after_attempt, wait_exponential, retry_if_exception_type
 import redis
+from redis.exceptions import RedisError, ConnectionError
+import msgpack
+import jwt
+from jwt.exceptions import InvalidTokenError
 
-# Load environment variables first
+# Load environment variables
 load_dotenv()
 
 # Initialize Flask app
 app = Flask(__name__)
 
-# Configure logging before anything else
+# Configure logging
 logging.basicConfig(
     level=logging.INFO,
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
@@ -49,8 +57,8 @@ SCOPES = [
     "https://www.googleapis.com/auth/userinfo.email",
     "openid"
 ]
-REDIRECT_URI = os.getenv("REDIRECT_URI", "https://ai-yenugu.onrender.com/api/drive-callback")
-FRONTEND_URL = os.getenv("FRONTEND_URL", "https://ai-yenugu.netlify.app")
+REDIRECT_URI = os.getenv("REDIRECT_URI", "http://localhost:5000/api/drive-callback")
+FRONTEND_URL = os.getenv("FRONTEND_URL", "http://localhost:3000")
 COHERE_API_KEY = os.getenv("COHERE_API_KEY")
 PROFILE_FILENAME = "user_profile.json"
 AVATAR_FILENAME_PREFIX = "user_avatar"
@@ -60,91 +68,211 @@ DEFAULT_CHAT_TITLE = "New Chat"
 MAX_CHAT_MESSAGE_LENGTH = 5000
 MAX_CHAT_TITLE_LENGTH = 100
 SESSION_COOKIE_NAME = 'ai_yenugu_session'
+CACHE_TTL = 3600
+THREAD_POOL_SIZE = 8
+JWT_SECRET = os.getenv("JWT_SECRET", secrets.token_hex(32))
+JWT_ALGORITHM = "HS256"
+JWT_EXPIRE_MINUTES = 30
 
-# Initialize Redis connection (Render-compatible)
-redis_url = os.getenv('REDIS_URL', 'redis://default:6T18RXJsymUjiqNNkEZgVucArLAyi080@redis-14356.c252.ap-southeast-1-1.ec2.redns.redis-cloud.com:14356')
-redis_conn = redis.from_url(redis_url)
+# Initialize thread pool
+executor = ThreadPoolExecutor(max_workers=THREAD_POOL_SIZE)
 
-# Verify Redis connection
-try:
-    redis_conn.ping()
-    logger.info("✅ Successfully connected to Redis")
-except redis.ConnectionError as e:
-    logger.error(f"❌ Failed to connect to Redis: {str(e)}")
-    raise
+# Redis Configuration
+def get_redis_connection():
+    try:
+        redis_url = os.getenv('REDIS_URL', 'redis://localhost:6379')
+        redis_conn = redis.Redis.from_url(
+            redis_url,
+            decode_responses=False,
+            socket_timeout=2,
+            socket_connect_timeout=2,
+            retry_on_timeout=True,
+            max_connections=20,
+            health_check_interval=30
+        )
+        redis_conn.ping()
+        
+        # Clear rate limiter keys
+        try:
+            script = """
+            local keys = redis.call('KEYS', 'LIMITER*')
+            if #keys > 0 then
+                return redis.call('DEL', unpack(keys))
+            end
+            return 0
+            """
+            redis_conn.eval(script, 0)
+        except Exception as e:
+            logger.warning(f"Could not clear rate limiter keys: {str(e)}")
+            
+        logger.info("✅ Successfully connected to Redis")
+        return redis_conn
+    except (RedisError, ConnectionError) as e:
+        logger.error(f"❌ Failed to connect to Redis: {str(e)}")
+        logger.warning("Using in-memory storage as fallback")
+        return None
+
+redis_conn = get_redis_connection()
 
 # Application Configuration
 app.secret_key = os.getenv("FLASK_SECRET_KEY", secrets.token_hex(32))
 app.config.update({
-    # Core Flask settings
     'SECRET_KEY': os.getenv("FLASK_SECRET_KEY", secrets.token_hex(32)),
     'SESSION_COOKIE_NAME': SESSION_COOKIE_NAME,
     'SESSION_COOKIE_SECURE': os.getenv('FLASK_ENV') == 'production',
     'SESSION_COOKIE_HTTPONLY': True,
     'SESSION_COOKIE_SAMESITE': 'Lax',
-    'SESSION_COOKIE_DOMAIN': None,
-    
-    # Flask-Session configuration
-    'SESSION_TYPE': 'redis',
+    'SESSION_REFRESH_EACH_REQUEST': True,
+    'PERMANENT_SESSION_LIFETIME': datetime.timedelta(minutes=JWT_EXPIRE_MINUTES),
+    'SESSION_TYPE': 'redis' if redis_conn else 'filesystem',
     'SESSION_REDIS': redis_conn,
     'SESSION_PERMANENT': True,
-    'PERMANENT_SESSION_LIFETIME': datetime.timedelta(hours=24),
     'SESSION_USE_SIGNER': True,
-    'SESSION_REFRESH_EACH_REQUEST': True,
-    
-    # Application settings
     'ALLOWED_EXTENSIONS': {'png', 'jpg', 'jpeg', 'gif', 'webp'},
     'MAX_AVATAR_SIZE': 2 * 1024 * 1024,
-    'COHERE_TIMEOUT': 30,
-    'GOOGLE_OAUTH_CACHE_TIMEOUT': 300,
+    'COHERE_TIMEOUT': 15,
     'MAX_CONTENT_LENGTH': 16 * 1024 * 1024,
     'CHAT_HISTORY_LIMIT': 50,
+    'JSONIFY_PRETTYPRINT_REGULAR': False,
+    'JSON_SORT_KEYS': False,
 })
 
-# Initialize Flask-Session (must come after config)
+# Initialize Flask-Session
 Session(app)
 
-# Initialize CORS with proper configuration
+# Initialize CORS
 CORS(app, resources={
     r"/api/*": {
         "origins": ["http://localhost:3000", "https://ai-yenugu.netlify.app"],
         "supports_credentials": True,
-        "allow_headers": ["Content-Type", "Authorization"],
-        "methods": ["GET", "POST", "PUT", "DELETE", "OPTIONS"]
+        "allow_headers": ["Content-Type", "Authorization", "X-Requested-With"],
+        "methods": ["GET", "POST", "PUT", "DELETE", "OPTIONS"],
+        "expose_headers": ["Content-Type", "X-CSRFToken"],
+        "max_age": 600
     }
 })
 
-@app.after_request
-def after_request(response):
-    # Skip if this is a health check or options request
-    if request.path == '/' or request.method == 'OPTIONS':
-        return response
+# JWT Utilities
+def create_jwt_token(user_id, email):
+    payload = {
+        "sub": user_id,
+        "email": email,
+        "exp": datetime.datetime.utcnow() + datetime.timedelta(minutes=JWT_EXPIRE_MINUTES),
+        "iat": datetime.datetime.utcnow()
+    }
+    return jwt.encode(payload, JWT_SECRET, algorithm=JWT_ALGORITHM)
 
-    # Add CORS headers - ensure no duplicates
-    if 'Access-Control-Allow-Origin' not in response.headers:
-        origin = request.headers.get('Origin', '')
-        if origin in ['http://localhost:3000', 'https://ai-yenugu.netlify.app']:
-            response.headers['Access-Control-Allow-Origin'] = origin
-            response.headers['Access-Control-Allow-Credentials'] = 'true'
-            response.headers['Access-Control-Allow-Methods'] = 'GET, POST, PUT, DELETE, OPTIONS'
-            response.headers['Access-Control-Allow-Headers'] = 'Content-Type, Authorization'
-    
-    return response
+def verify_jwt_token(token):
+    try:
+        payload = jwt.decode(token, JWT_SECRET, algorithms=[JWT_ALGORITHM])
+        return payload
+    except InvalidTokenError:
+        return None
 
-# Initialize rate limiter with Redis storage
+# Rate Limiter
 try:
     limiter = Limiter(
         app=app,
         key_func=get_remote_address,
-        storage_uri=redis_url,
-        default_limits=["200 per day", "50 per hour"],
+        storage_uri=os.getenv('REDIS_URL') if redis_conn else "memory://",
+        storage_options={
+            "socket_timeout": 2,
+            "socket_connect_timeout": 2,
+            "retry_on_timeout": True,
+            "health_check_interval": 30
+        } if redis_conn else {},
         strategy="fixed-window",
-        enabled=True
+        default_limits=["500 per day", "100 per hour"],
+        headers_enabled=True,
+        on_breach=lambda _: None,
+        key_prefix="fast_limiter"
     )
-    logger.info("✅ Rate limiter initialized with Redis")
+    logger.info("✅ Rate limiter initialized")
 except Exception as e:
     logger.error(f"❌ Error initializing rate limiter: {e}")
-    limiter = Limiter(app=app, key_func=get_remote_address, enabled=False)
+    limiter = Limiter(
+        app=app,
+        key_func=get_remote_address,
+        storage_uri="memory://",
+        strategy="fixed-window",
+        default_limits=["500 per day", "100 per hour"]
+    )
+
+@app.errorhandler(RateLimitExceeded)
+def handle_rate_limit_exceeded(e):
+    return jsonify({"error": "Rate limit exceeded"}), 429
+
+@app.errorhandler(RedisError)
+def handle_redis_error(e):
+    logger.error(f"Redis error: {str(e)}")
+    return jsonify({
+        "error": "System temporarily unavailable",
+        "status": "service_unavailable"
+    }), 503
+
+@app.after_request
+def after_request(response):
+    if request.method == 'OPTIONS':
+        return response
+
+    origin = request.headers.get('Origin', '')
+    allowed_origins = ['http://localhost:3000', 'https://ai-yenugu.netlify.app']
+    
+    if origin in allowed_origins:
+        response.headers['Access-Control-Allow-Origin'] = origin
+        response.headers['Access-Control-Allow-Credentials'] = 'true'
+    
+    response.headers['X-Content-Type-Options'] = 'nosniff'
+    response.headers['X-Frame-Options'] = 'SAMEORIGIN'
+    response.headers['X-XSS-Protection'] = '1; mode=block'
+    
+    if request.path.startswith('/api/'):
+        response.headers['Cache-Control'] = 'no-store, no-cache, must-revalidate'
+        response.headers['Pragma'] = 'no-cache'
+        response.headers['Expires'] = '0'
+    else:
+        response.headers['Cache-Control'] = 'public, max-age=3600'
+    
+    return response
+
+# Utility functions
+def cache_response(ttl=CACHE_TTL, key_prefix='fast_cache'):
+    def decorator(f):
+        @wraps(f)
+        def wrapped(*args, **kwargs):
+            if app.config.get('TESTING', False):
+                return f(*args, **kwargs)
+                
+            cache_key = f"{key_prefix}:{request.path}:{hash(frozenset(request.args.items()))}"
+            
+            try:
+                if redis_conn:
+                    cached = redis_conn.get(cache_key)
+                    if cached:
+                        return Response(
+                            cached,
+                            content_type='application/json',
+                            status=200
+                        )
+            except RedisError:
+                pass
+                
+            result = f(*args, **kwargs)
+            
+            try:
+                if redis_conn and result.status_code == 200:
+                    redis_conn.setex(
+                        cache_key,
+                        ttl,
+                        result.get_data(),
+                        nx=True
+                    )
+            except RedisError:
+                pass
+                
+            return result
+        return wrapped
+    return decorator
 
 def requires_drive_connection(f):
     @wraps(f)
@@ -189,14 +317,43 @@ def validate_chat_title(title):
         raise ValueError(f"Title too long (max {MAX_CHAT_TITLE_LENGTH} characters)")
     return title
 
+# Drive Manager with caching
 class DriveManager:
+    _service_cache = {}
+    _folder_cache = {}
+    
+    @staticmethod
+    def get_flow():
+        client_config = {
+            "web": {
+                "client_id": os.getenv("GOOGLE_CLIENT_ID"),
+                "client_secret": os.getenv("GOOGLE_CLIENT_SECRET"),
+                "auth_uri": "https://accounts.google.com/o/oauth2/auth",
+                "token_uri": "https://oauth2.googleapis.com/token",
+                "redirect_uris": [REDIRECT_URI]
+            }
+        }
+
+        if os.getenv('FLASK_ENV') != 'production':
+            os.environ['OAUTHLIB_INSECURE_TRANSPORT'] = '1'
+
+        return Flow.from_client_config(
+            client_config,
+            scopes=SCOPES,
+            redirect_uri=REDIRECT_URI
+        )
+
     @staticmethod
     @retry(
         stop=stop_after_attempt(3),
-        wait=wait_exponential(multiplier=1, min=2, max=10),
+        wait=wait_exponential(multiplier=1, min=1, max=5),
         retry=retry_if_exception_type(HttpError)
     )
     def get_service(credentials):
+        cache_key = f"service:{credentials['token']}"
+        if cache_key in DriveManager._service_cache:
+            return DriveManager._service_cache[cache_key]
+            
         creds = Credentials(
             token=credentials['token'],
             refresh_token=credentials['refresh_token'],
@@ -207,19 +364,39 @@ class DriveManager:
         )
 
         if creds.expired and creds.refresh_token:
-            creds.refresh(requests.Request())
-            session['credentials']['token'] = creds.token
-            session.modified = True
+            def refresh_token():
+                try:
+                    creds.refresh(requests.Request())
+                    session['credentials']['token'] = creds.token
+                    session.modified = True
+                except Exception as e:
+                    logger.error(f"Token refresh failed: {str(e)}")
 
-        return build('drive', 'v3', credentials=creds, cache_discovery=False)
+            executor.submit(refresh_token)
+
+        service = build('drive', 'v3', credentials=creds, cache_discovery=False, static_discovery=False)
+        DriveManager._service_cache[cache_key] = service
+        return service
 
     @staticmethod
     @retry(
         stop=stop_after_attempt(3),
-        wait=wait_exponential(multiplier=1, min=2, max=10),
-        retry=retry_if_exception_type(HttpError)
-    )
+        wait=wait_exponential(multiplier=1, min=1, max=5),
+        retry=retry_if_exception_type(HttpError))
     def ensure_folder(service, folder_name):
+        cache_key = f"folder:{folder_name}"
+        if cache_key in DriveManager._folder_cache:
+            return DriveManager._folder_cache[cache_key]
+            
+        try:
+            if redis_conn:
+                cached = redis_conn.get(cache_key)
+                if cached:
+                    DriveManager._folder_cache[cache_key] = cached.decode('utf-8')
+                    return cached.decode('utf-8')
+        except RedisError:
+            pass
+            
         query = f"mimeType='application/vnd.google-apps.folder' and name='{folder_name}' and trashed=false"
         folders = service.files().list(
             q=query,
@@ -228,7 +405,14 @@ class DriveManager:
         ).execute().get('files', [])
 
         if folders:
-            return folders[0]['id']
+            folder_id = folders[0]['id']
+            DriveManager._folder_cache[cache_key] = folder_id
+            try:
+                if redis_conn:
+                    redis_conn.setex(cache_key, CACHE_TTL, folder_id)
+            except RedisError:
+                pass
+            return folder_id
 
         folder_metadata = {
             'name': folder_name,
@@ -238,14 +422,21 @@ class DriveManager:
             body=folder_metadata,
             fields='id'
         ).execute()
+        
+        DriveManager._folder_cache[cache_key] = folder['id']
+        try:
+            if redis_conn:
+                redis_conn.setex(cache_key, CACHE_TTL, folder['id'])
+        except RedisError:
+            pass
+            
         return folder['id']
 
     @staticmethod
     @retry(
         stop=stop_after_attempt(3),
-        wait=wait_exponential(multiplier=1, min=2, max=10),
-        retry=retry_if_exception_type(HttpError)
-    )
+        wait=wait_exponential(multiplier=1, min=1, max=5),
+        retry=retry_if_exception_type(HttpError))
     def upload_file(service, folder_id, filename, content, mime_type):
         query = f"name='{filename}' and '{folder_id}' in parents and trashed=false"
         existing_files = service.files().list(
@@ -278,10 +469,18 @@ class DriveManager:
     @staticmethod
     @retry(
         stop=stop_after_attempt(3),
-        wait=wait_exponential(multiplier=1, min=2, max=10),
-        retry=retry_if_exception_type(HttpError)
-    )
+        wait=wait_exponential(multiplier=1, min=1, max=5),
+        retry=retry_if_exception_type(HttpError))
     def download_file(service, folder_id, filename):
+        cache_key = f"file:{folder_id}:{filename}"
+        try:
+            if redis_conn:
+                cached = redis_conn.get(cache_key)
+                if cached:
+                    return cached
+        except RedisError:
+            pass
+            
         query = f"name='{filename}' and '{folder_id}' in parents and trashed=false"
         files = service.files().list(
             q=query,
@@ -300,14 +499,21 @@ class DriveManager:
         while not done:
             status, done = downloader.next_chunk()
 
-        return fh.getvalue()
+        content = fh.getvalue()
+        
+        try:
+            if redis_conn:
+                redis_conn.setex(cache_key, CACHE_TTL, content)
+        except RedisError:
+            pass
+            
+        return content
 
     @staticmethod
     @retry(
         stop=stop_after_attempt(3),
-        wait=wait_exponential(multiplier=1, min=2, max=10),
-        retry=retry_if_exception_type(HttpError)
-    )
+        wait=wait_exponential(multiplier=1, min=1, max=5),
+        retry=retry_if_exception_type(HttpError))
     def find_avatar_file(service, folder_id):
         query = f"name contains '{AVATAR_FILENAME_PREFIX}' and '{folder_id}' in parents and trashed=false"
         files = service.files().list(
@@ -320,11 +526,6 @@ class DriveManager:
         return files[0] if files else None
 
     @staticmethod
-    @retry(
-        stop=stop_after_attempt(3),
-        wait=wait_exponential(multiplier=1, min=2, max=10),
-        retry=retry_if_exception_type(HttpError)
-    )
     def delete_file(service, folder_id, filename):
         query = f"name='{filename}' and '{folder_id}' in parents and trashed=false"
         files = service.files().list(
@@ -337,14 +538,17 @@ class DriveManager:
             return False
 
         service.files().delete(fileId=files[0]['id']).execute()
+        
+        cache_key = f"file:{folder_id}:{filename}"
+        try:
+            if redis_conn:
+                redis_conn.delete(cache_key)
+        except RedisError:
+            pass
+            
         return True
 
     @staticmethod
-    @retry(
-        stop=stop_after_attempt(3),
-        wait=wait_exponential(multiplier=1, min=2, max=10),
-        retry=retry_if_exception_type(HttpError)
-    )
     def delete_all_avatars(service, folder_id):
         query = f"name contains '{AVATAR_FILENAME_PREFIX}' and '{folder_id}' in parents and trashed=false"
         files = service.files().list(
@@ -357,9 +561,17 @@ class DriveManager:
 
         for file in files:
             service.files().delete(fileId=file['id']).execute()
+            
+            cache_key = f"file:{folder_id}:{file['id']}"
+            try:
+                if redis_conn:
+                    redis_conn.delete(cache_key)
+            except RedisError:
+                pass
 
         return True
 
+# Auth Manager with JWT
 class AuthManager:
     @staticmethod
     def get_flow():
@@ -384,10 +596,9 @@ class AuthManager:
 
     @staticmethod
     @retry(
-        stop=stop_after_attempt(3),
-        wait=wait_exponential(multiplier=1, min=2, max=10),
-        retry=retry_if_exception_type(HttpError)
-    )
+        stop=stop_after_attempt(2),
+        wait=wait_exponential(multiplier=1, min=1, max=3),
+        retry=retry_if_exception_type(HttpError))
     def get_user_info(credentials):
         creds = Credentials(
             token=credentials['token'],
@@ -398,7 +609,7 @@ class AuthManager:
             scopes=credentials['scopes']
         )
 
-        oauth2_client = build('oauth2', 'v2', credentials=creds)
+        oauth2_client = build('oauth2', 'v2', credentials=creds, static_discovery=False)
         return oauth2_client.userinfo().get().execute()
 
     @staticmethod
@@ -410,6 +621,21 @@ class AuthManager:
         </script></body></html>
         """
 
+    @staticmethod
+    def auth_success_response(user_info):
+        token = create_jwt_token(user_info.get('id', user_info.get('email')), user_info.get('email'))
+        return f"""
+        <html><body><script>
+            window.opener.postMessage({{
+                type: 'auth-success',
+                token: '{token}',
+                user: {json.dumps(user_info)}
+            }}, '{FRONTEND_URL}');
+            window.close();
+        </script></body></html>
+        """
+
+# Profile Manager
 class ProfileManager:
     @staticmethod
     def validate_profile_data(data):
@@ -444,8 +670,9 @@ class ProfileManager:
 
     @staticmethod
     def generate_avatar_filename(extension):
-        return f"{AVATAR_FILENAME_PREFIX}.{extension}"
+        return f"{AVATAR_FILENAME_PREFIX}_{uuid.uuid4().hex[:8]}.{extension}"
 
+# Chat Manager
 class ChatManager:
     @staticmethod
     def initialize_chat_session():
@@ -474,12 +701,18 @@ class ChatManager:
 
     @staticmethod
     def save_chat_to_drive(service, folder_id, chat_id, chat_data):
-        DriveManager.upload_file(
-            service, folder_id,
-            f"chat_{chat_id}.json",
-            json.dumps(chat_data, indent=2).encode('utf-8'),
-            'application/json'
-        )
+        def _save():
+            try:
+                DriveManager.upload_file(
+                    service, folder_id,
+                    f"chat_{chat_id}.json",
+                    msgpack.packb(chat_data),
+                    'application/octet-stream'
+                )
+            except Exception as e:
+                logger.error(f"Background save to Drive failed: {str(e)}")
+
+        executor.submit(_save)
 
     @staticmethod
     def generate_chat_title(messages):
@@ -502,9 +735,16 @@ def is_drive_connected():
     try:
         creds = Credentials(**session['credentials'])
         if creds.expired and creds.refresh_token:
-            creds.refresh(requests.Request())
-            session['credentials']['token'] = creds.token
-            session.modified = True
+            # Async refresh
+            def refresh():
+                try:
+                    creds.refresh(requests.Request())
+                    session['credentials']['token'] = creds.token
+                    session.modified = True
+                except Exception as e:
+                    logger.error(f"Token refresh failed: {str(e)}")
+            
+            executor.submit(refresh)
         return True
     except Exception as e:
         logger.warning(f"Invalid credentials: {str(e)}")
@@ -515,7 +755,7 @@ def is_drive_connected():
 
 @retry(
     stop=stop_after_attempt(3),
-    wait=wait_exponential(multiplier=1, min=4, max=10),
+    wait=wait_exponential(multiplier=1, min=2, max=10),
     retry=retry_if_exception_type(requests.exceptions.RequestException)
 )
 def generate_cohere_response(message, chat_history=None):
@@ -533,6 +773,7 @@ def generate_cohere_response(message, chat_history=None):
         "model": "command",
         "temperature": 0.7,
         "max_tokens": 1000,
+        "stream": False
     }
 
     if chat_history:
@@ -543,11 +784,12 @@ def generate_cohere_response(message, chat_history=None):
         ]
 
     try:
+        start_time = time.time()
         response = requests.post(
             COHERE_API_URL,
             headers=headers,
             json=data,
-            timeout=(10, app.config['COHERE_TIMEOUT'])
+            timeout=(3, 10)  # Reduced timeouts
         )
 
         if response.status_code == 429:
@@ -561,6 +803,7 @@ def generate_cohere_response(message, chat_history=None):
         if "text" not in response_data:
             raise ValueError("Unexpected response format from Cohere API")
 
+        logger.info(f"Cohere API call completed in {time.time() - start_time:.2f}s")
         return response_data["text"]
     except requests.exceptions.RequestException as e:
         logger.error(f"Cohere API request failed: {str(e)}")
@@ -572,8 +815,15 @@ def generate_cohere_response(message, chat_history=None):
         logger.error(f"Unexpected error in Cohere API call: {str(e)}")
         raise
 
+# Routes
 @app.route('/', methods=['GET', 'HEAD'])
 def health_check():
+    redis_status = False
+    try:
+        redis_status = redis_conn.ping() if redis_conn else False
+    except RedisError:
+        pass
+
     return jsonify({
         "status": "healthy",
         "timestamp": datetime.datetime.now().isoformat(),
@@ -581,14 +831,14 @@ def health_check():
             "cohere": bool(COHERE_API_KEY),
             "google_drive": bool(os.getenv("GOOGLE_CLIENT_ID")),
             "session": True,
-            "redis": redis_conn.ping() if redis_conn else False
+            "redis": redis_status
         }
     })
 
-@app.route('/api/drive-login', methods=['GET'])
-@limiter.limit("10 per minute")
+@app.route('/api/drive-auth-url', methods=['GET'])
+@limiter.limit("20 per minute")
 @handle_api_errors
-def drive_login():
+def drive_auth_url():
     state = secrets.token_urlsafe(32)
     session['oauth_state'] = state
     session['oauth_state_timestamp'] = time.time()
@@ -606,23 +856,29 @@ def drive_login():
 @app.route('/api/drive-callback', methods=['GET'])
 @handle_api_errors
 def drive_callback():
+    logger.info(f"OAuth callback received with args: {dict(request.args)}")
+    
     state = request.args.get('state')
     stored_state = session.get('oauth_state')
     state_timestamp = session.get('oauth_state_timestamp', 0)
 
     if not state or not stored_state or not secrets.compare_digest(state, stored_state):
-        logger.error("State validation failed - possible CSRF attack")
+        logger.error(f"State validation failed. Received: {state}, Expected: {stored_state}")
         return AuthManager.auth_error_response("invalid_state")
 
-    if time.time() - state_timestamp > 300:
-        logger.error("State token expired")
+    if time.time() - state_timestamp > 180:
+        logger.error(f"State token expired. Age: {time.time() - state_timestamp} seconds")
         return AuthManager.auth_error_response("expired_state")
 
     session.pop('oauth_state', None)
     session.pop('oauth_state_timestamp', None)
 
     flow = AuthManager.get_flow()
-    flow.fetch_token(authorization_response=request.url)
+    try:
+        flow.fetch_token(authorization_response=request.url)
+    except Exception as e:
+        logger.error(f"Error fetching token: {str(e)}")
+        return AuthManager.auth_error_response("token_fetch_failed")
 
     credentials = flow.credentials
     session['credentials'] = {
@@ -634,27 +890,34 @@ def drive_callback():
         'scopes': credentials.scopes
     }
 
-    service = DriveManager.get_service(session['credentials'])
-    session['drive_folder_id'] = DriveManager.ensure_folder(service, CHATS_FOLDER_NAME)
+    try:
+        # Parallelize service initialization and user info fetch
+        def get_service_and_user():
+            service = DriveManager.get_service(session['credentials'])
+            session['drive_folder_id'] = DriveManager.ensure_folder(service, CHATS_FOLDER_NAME)
+            return AuthManager.get_user_info(session['credentials'])
 
-    user_info = AuthManager.get_user_info(session['credentials'])
-    session['user_info'] = {
-        'email': user_info.get('email', ''),
-        'name': user_info.get('name', ''),
-        'picture': user_info.get('picture', '')
-    }
+        user_info = get_service_and_user()
+        
+        session['user_info'] = {
+            'id': user_info.get('id', user_info.get('email', '')),
+            'email': user_info.get('email', ''),
+            'name': user_info.get('name', ''),
+            'picture': user_info.get('picture', '')
+        }
+        session.modified = True
+        
+        logger.info(f"User authenticated: {user_info.get('email')}")
+        return AuthManager.auth_success_response(session['user_info'])
 
-    session.modified = True
-
-    return f"""
-    <html><body><script>
-        window.opener.postMessage({{type: 'auth-success'}}, '{FRONTEND_URL}');
-        window.close();
-    </script></body></html>
-    """
+    except Exception as e:
+        logger.error(f"Drive initialization failed: {str(e)}")
+        session.clear()
+        return AuthManager.auth_error_response("drive_init_failed")
 
 @app.route('/api/auth-status', methods=['GET'])
 @handle_api_errors
+@cache_response(ttl=30)
 def auth_status():
     if not is_drive_connected():
         return jsonify({
@@ -665,23 +928,17 @@ def auth_status():
 
     user_info = session.get('user_info', {})
     if not user_info:
-        user_info = AuthManager.get_user_info(session['credentials'])
-        session['user_info'] = user_info
-        session.modified = True
-
-    has_profile = False
-    has_avatar = False
-    try:
-        service = DriveManager.get_service(session['credentials'])
-        folder_id = session['drive_folder_id']
-
-        query = f"name='{PROFILE_FILENAME}' and '{folder_id}' in parents and trashed=false"
-        files = service.files().list(q=query, fields="files(id)", pageSize=1).execute().get('files', [])
-        has_profile = len(files) > 0
-
-        has_avatar = DriveManager.find_avatar_file(service, folder_id) is not None
-    except Exception as e:
-        logger.error(f"Error checking profile/avatar status: {str(e)}")
+        try:
+            user_info = AuthManager.get_user_info(session['credentials'])
+            session['user_info'] = user_info
+            session.modified = True
+        except Exception as e:
+            logger.error(f"Error getting user info: {str(e)}")
+            return jsonify({
+                "authenticated": False,
+                "drive_connected": False,
+                "user": None
+            })
 
     return jsonify({
         "authenticated": True,
@@ -690,9 +947,7 @@ def auth_status():
             "email": user_info.get('email', ''),
             "name": user_info.get('name', ''),
             "picture": user_info.get('picture', '')
-        },
-        "has_profile": has_profile,
-        "has_avatar": has_avatar
+        }
     })
 
 @app.route('/api/profile', methods=['GET', 'POST'])
@@ -704,12 +959,13 @@ def profile_handler():
 
     if request.method == 'GET':
         try:
-            profile_data = json.loads(
-                DriveManager.download_file(service, folder_id, PROFILE_FILENAME).decode('utf-8')
+            profile_data = msgpack.unpackb(
+                DriveManager.download_file(service, folder_id, PROFILE_FILENAME),
+                raw=False
             )
 
             if DriveManager.find_avatar_file(service, folder_id):
-                profile_data['avatar_url'] = f"/api/avatar?t={uuid.uuid4()}"
+                profile_data['avatar_url'] = f"/api/avatar?t={uuid.uuid4().hex[:8]}"
 
             return jsonify({"profile": profile_data})
         except FileNotFoundError:
@@ -746,12 +1002,12 @@ def profile_handler():
                     service, folder_id, avatar_filename,
                     avatar_content, avatar_file.mimetype
                 )
-                profile_data['avatar_url'] = f"/api/avatar?t={uuid.uuid4()}"
+                profile_data['avatar_url'] = f"/api/avatar?t={uuid.uuid4().hex[:8]}"
 
         DriveManager.upload_file(
             service, folder_id, PROFILE_FILENAME,
-            json.dumps(profile_data, indent=2).encode('utf-8'),
-            'application/json'
+            msgpack.packb(profile_data),
+            'application/octet-stream'
         )
 
         return jsonify({
@@ -763,6 +1019,7 @@ def profile_handler():
 @app.route('/api/avatar', methods=['GET'])
 @requires_drive_connection
 @handle_api_errors
+@cache_response(ttl=86400)
 def get_avatar():
     service = DriveManager.get_service(session['credentials'])
     folder_id = session['drive_folder_id']
@@ -816,7 +1073,18 @@ def chat():
     try:
         chat_history = session['chat_sessions'][chat_id]["messages"][-10:]
 
-        ai_response = generate_cohere_response(message, chat_history)
+        def generate_response():
+            try:
+                return generate_cohere_response(message, chat_history)
+            except Exception as e:
+                logger.error(f"Error generating response: {str(e)}")
+                return None
+
+        future = executor.submit(generate_response)
+        ai_response = future.result(timeout=10)  # Reduced timeout
+
+        if not ai_response:
+            raise Exception("Failed to generate response")
 
         ai_message = ChatManager.create_chat_message(ai_response, "ai")
         session['chat_sessions'][chat_id]["messages"].append(ai_message)
@@ -829,15 +1097,12 @@ def chat():
         session.modified = True
 
         if is_drive_connected():
-            try:
-                service = DriveManager.get_service(session['credentials'])
-                folder_id = session['drive_folder_id']
-                ChatManager.save_chat_to_drive(
-                    service, folder_id, chat_id,
-                    session['chat_sessions'][chat_id]
-                )
-            except Exception as e:
-                logger.error(f"Error saving chat to Drive: {str(e)}")
+            ChatManager.save_chat_to_drive(
+                DriveManager.get_service(session['credentials']),
+                session['drive_folder_id'],
+                chat_id,
+                session['chat_sessions'][chat_id]
+            )
 
         return jsonify({
             "response": ai_response,
@@ -862,6 +1127,7 @@ def chat():
 
 @app.route('/api/chats', methods=['GET'])
 @handle_api_errors
+@cache_response(ttl=60)
 def list_chats():
     chats = []
     session.setdefault('chat_sessions', {})
@@ -926,6 +1192,7 @@ def list_chats():
 
 @app.route('/api/chat/<chat_id>', methods=['GET'])
 @handle_api_errors
+@cache_response(ttl=30)
 def get_chat(chat_id):
     ChatManager.initialize_chat_session()
 
@@ -944,8 +1211,9 @@ def get_chat(chat_id):
         try:
             service = DriveManager.get_service(session['credentials'])
             folder_id = session['drive_folder_id']
-            chat_data = json.loads(
-                DriveManager.download_file(service, folder_id, f"chat_{chat_id}.json").decode('utf-8')
+            chat_data = msgpack.unpackb(
+                DriveManager.download_file(service, folder_id, f"chat_{chat_id}.json"),
+                raw=False
             )
 
             session['chat_sessions'][chat_id] = chat_data
@@ -1017,15 +1285,16 @@ def update_chat_title(chat_id):
         try:
             service = DriveManager.get_service(session['credentials'])
             folder_id = session['drive_folder_id']
-            chat_data = json.loads(
-                DriveManager.download_file(service, folder_id, f"chat_{chat_id}.json").decode('utf-8')
+            chat_data = msgpack.unpackb(
+                DriveManager.download_file(service, folder_id, f"chat_{chat_id}.json"),
+                raw=False
             )
             chat_data['title'] = new_title
             DriveManager.upload_file(
                 service, folder_id,
                 f"chat_{chat_id}.json",
-                json.dumps(chat_data, indent=2).encode('utf-8'),
-                'application/json'
+                msgpack.packb(chat_data),
+                'application/octet-stream'
             )
             updated_in.append("drive")
         except FileNotFoundError:
@@ -1055,7 +1324,7 @@ def logout():
                 'https://oauth2.googleapis.com/revoke',
                 params={'token': creds.token},
                 headers={'content-type': 'application/x-www-form-urlencoded'},
-                timeout=5
+                timeout=3  # Reduced timeout
             )
         except Exception as e:
             logger.warning(f"Error revoking token: {str(e)}")
@@ -1068,6 +1337,6 @@ if __name__ == '__main__':
         os.environ['OAUTHLIB_INSECURE_TRANSPORT'] = '1'
         app.debug = True
 
-    logger.info("Starting Flask server")
+    logger.info("Starting optimized Flask server")
     port = int(os.environ.get('PORT', 5000))
-    app.run(host='0.0.0.0', port=port)
+    app.run(host='0.0.0.0', port=port, threaded=True)

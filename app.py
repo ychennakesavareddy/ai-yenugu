@@ -57,7 +57,7 @@ SCOPES = [
     "https://www.googleapis.com/auth/userinfo.email",
     "openid"
 ]
-REDIRECT_URI = os.getenv("REDIRECT_URI", "http://localhost:5000/api/drive-callback")
+REDIRECT_URI = os.getenv("REDIRECT_URI", "https://your-app.onrender.com/api/drive-callback")
 FRONTEND_URL = os.getenv("FRONTEND_URL", "http://localhost:3000")
 COHERE_API_KEY = os.getenv("COHERE_API_KEY")
 PROFILE_FILENAME = "user_profile.json"
@@ -65,9 +65,9 @@ AVATAR_FILENAME_PREFIX = "user_avatar"
 CHATS_FOLDER_NAME = "AI Chat Storage"
 COHERE_API_URL = "https://api.cohere.ai/v1/chat"
 DEFAULT_CHAT_TITLE = "New Chat"
-MAX_CHAT_MESSAGE_LENGTH = 5000
+MAX_CHAT_MESSAGE_LENGTH = 15000  # Increased for complex problems
 MAX_CHAT_TITLE_LENGTH = 100
-SESSION_COOKIE_NAME = 'ai_yenugu_session'
+SESSION_COOKIE_NAME = 'ai_session'
 CACHE_TTL = 3600
 THREAD_POOL_SIZE = 8
 JWT_SECRET = os.getenv("JWT_SECRET", secrets.token_hex(32))
@@ -91,20 +91,6 @@ def get_redis_connection():
             health_check_interval=30
         )
         redis_conn.ping()
-        
-        # Clear rate limiter keys
-        try:
-            script = """
-            local keys = redis.call('KEYS', 'LIMITER*')
-            if #keys > 0 then
-                return redis.call('DEL', unpack(keys))
-            end
-            return 0
-            """
-            redis_conn.eval(script, 0)
-        except Exception as e:
-            logger.warning(f"Could not clear rate limiter keys: {str(e)}")
-            
         logger.info("✅ Successfully connected to Redis")
         return redis_conn
     except (RedisError, ConnectionError) as e:
@@ -130,7 +116,7 @@ app.config.update({
     'SESSION_USE_SIGNER': True,
     'ALLOWED_EXTENSIONS': {'png', 'jpg', 'jpeg', 'gif', 'webp'},
     'MAX_AVATAR_SIZE': 2 * 1024 * 1024,
-    'COHERE_TIMEOUT': 15,
+    'COHERE_TIMEOUT': 30,  # Increased timeout for complex responses
     'MAX_CONTENT_LENGTH': 16 * 1024 * 1024,
     'CHAT_HISTORY_LIMIT': 50,
     'JSONIFY_PRETTYPRINT_REGULAR': False,
@@ -143,7 +129,7 @@ Session(app)
 # Initialize CORS
 CORS(app, resources={
     r"/api/*": {
-        "origins": ["http://localhost:3000", "https://ai-yenugu.netlify.app"],
+        "origins": ["http://localhost:3000", FRONTEND_URL],
         "supports_credentials": True,
         "allow_headers": ["Content-Type", "Authorization", "X-Requested-With"],
         "methods": ["GET", "POST", "PUT", "DELETE", "OPTIONS"],
@@ -216,7 +202,7 @@ def after_request(response):
         return response
 
     origin = request.headers.get('Origin', '')
-    allowed_origins = ['http://localhost:3000', 'https://ai-yenugu.netlify.app']
+    allowed_origins = ['http://localhost:3000', FRONTEND_URL]
     
     if origin in allowed_origins:
         response.headers['Access-Control-Allow-Origin'] = origin
@@ -264,8 +250,7 @@ def cache_response(ttl=CACHE_TTL, key_prefix='fast_cache'):
                     redis_conn.setex(
                         cache_key,
                         ttl,
-                        result.get_data(),
-                        nx=True
+                        result.get_data()
                     )
             except RedisError:
                 pass
@@ -772,7 +757,7 @@ def generate_cohere_response(message, chat_history=None):
         "message": message,
         "model": "command",
         "temperature": 0.7,
-        "max_tokens": 1000,
+        "max_tokens": 2000,  # Increased for complex responses
         "stream": False
     }
 
@@ -789,7 +774,7 @@ def generate_cohere_response(message, chat_history=None):
             COHERE_API_URL,
             headers=headers,
             json=data,
-            timeout=(3, 10)  # Reduced timeouts
+            timeout=(10, 30)  # Increased timeouts for complex problems
         )
 
         if response.status_code == 429:
@@ -1081,7 +1066,7 @@ def chat():
                 return None
 
         future = executor.submit(generate_response)
-        ai_response = future.result(timeout=10)  # Reduced timeout
+        ai_response = future.result(timeout=30)  # Increased timeout for complex problems
 
         if not ai_response:
             raise Exception("Failed to generate response")
@@ -1324,7 +1309,7 @@ def logout():
                 'https://oauth2.googleapis.com/revoke',
                 params={'token': creds.token},
                 headers={'content-type': 'application/x-www-form-urlencoded'},
-                timeout=3  # Reduced timeout
+                timeout=3
             )
         except Exception as e:
             logger.warning(f"Error revoking token: {str(e)}")

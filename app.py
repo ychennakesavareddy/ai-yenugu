@@ -7,7 +7,7 @@ import hashlib
 from functools import wraps
 from concurrent.futures import ThreadPoolExecutor
 from dotenv import load_dotenv
-from flask import Flask, request, jsonify
+from flask import Flask, request, jsonify, send_from_directory
 from flask_cors import CORS
 from flask_limiter import Limiter
 from flask_limiter.util import get_remote_address
@@ -22,7 +22,7 @@ import redis
 load_dotenv()
 
 # Initialize Flask app
-app = Flask(__name__)
+app = Flask(__name__, static_folder='../frontend/build', static_url_path='')
 
 # Configure logging
 logging.basicConfig(
@@ -39,21 +39,23 @@ COHERE_API_KEY = os.getenv("COHERE_API_KEY")
 COHERE_API_URL = "https://api.cohere.ai/v1/chat"
 MAX_CHAT_MESSAGE_LENGTH = 50000
 MAX_RESPONSE_TOKENS = 4000
-THREAD_POOL_SIZE = 8  # Increased for better concurrency
+THREAD_POOL_SIZE = 4  # Optimized for Render's free tier
 JWT_SECRET = os.getenv("JWT_SECRET", os.urandom(32).hex())
 JWT_ALGORITHM = "HS256"
 JWT_EXPIRE_MINUTES = 1440
 PASSWORD_HASH_ROUNDS = 12
 
-# Initialize Redis for rate limiting storage
-redis_client = redis.Redis(
+# Initialize Redis connection pool for better performance
+redis_pool = redis.ConnectionPool(
     host=os.getenv("REDIS_HOST", "localhost"),
     port=int(os.getenv("REDIS_PORT", 6379)),
     password=os.getenv("REDIS_PASSWORD", ""),
-    decode_responses=True
+    decode_responses=True,
+    max_connections=20
 )
+redis_client = redis.Redis(connection_pool=redis_pool)
 
-# Initialize thread pool with more workers
+# Initialize thread pool with optimized workers
 executor = ThreadPoolExecutor(
     max_workers=THREAD_POOL_SIZE,
     thread_name_prefix='api_worker'
@@ -69,7 +71,7 @@ app.config.update({
 # Initialize CORS with preflight options
 CORS(app, resources={
     r"/api/*": {
-        "origins": os.getenv("ALLOWED_ORIGINS", "").split(","),
+        "origins": os.getenv("ALLOWED_ORIGINS", "*").split(","),
         "methods": ["GET", "POST", "OPTIONS"],
         "allow_headers": ["Content-Type", "Authorization"],
         "supports_credentials": True,
@@ -88,7 +90,13 @@ limiter = Limiter(
 )
 
 # Database simulation (replace with real DB in production)
-users_db = {}
+users_db = {
+    "admin@gmail.com": {
+        "id": str(uuid.uuid4()),
+        "name": "Admin",
+        "password": bcrypt.hashpw(b"admin123", bcrypt.gensalt(PASSWORD_HASH_ROUNDS)).decode('utf-8')
+    }
+}
 chats_db = {}
 
 # Utility functions with caching
@@ -114,7 +122,7 @@ def verify_jwt_token(token: str) -> dict:
     except InvalidTokenError:
         return None
 
-# Optimized Cohere API call with caching
+# Optimized Cohere API call with caching and connection pooling
 @retry(
     stop=stop_after_attempt(3),
     wait=wait_exponential(multiplier=1, min=1, max=10),
@@ -148,14 +156,15 @@ def generate_cohere_response(message: str, chat_history: list = None) -> str:
 
     try:
         start_time = time.time()
-        response = requests.post(
-            COHERE_API_URL,
-            headers=headers,
-            json=data,
-            timeout=(3, 30)  # Shorter timeouts for better failover
-        )
-        response.raise_for_status()
-        result = response.json().get("text", "")
+        with requests.Session() as session:
+            response = session.post(
+                COHERE_API_URL,
+                headers=headers,
+                json=data,
+                timeout=(3, 30)  # Shorter timeouts for better failover
+            )
+            response.raise_for_status()
+            result = response.json().get("text", "")
         
         # Cache successful responses for 5 minutes
         redis_client.setex(cache_key, 300, result)
@@ -172,17 +181,26 @@ def authenticate_request():
         return None
     return verify_jwt_token(auth_header.split(' ')[1])
 
-# Routes
+# Serve React Frontend
+@app.route('/', defaults={'path': ''})
+@app.route('/<path:path>')
+def serve(path):
+    if path != "" and os.path.exists(app.static_folder + '/' + path):
+        return send_from_directory(app.static_folder, path)
+    else:
+        return send_from_directory(app.static_folder, 'index.html')
+
+# API Routes
 @app.route('/api/health', methods=['GET'])
 @limiter.limit("10 per minute")
 def health_check():
     return jsonify({
         "status": "healthy",
         "timestamp": time.time(),
-        "endpoints": {
-            "signin": "/api/auth/signin",
-            "signup": "/api/auth/signup",
-            "chat": "/api/chat"
+        "services": {
+            "cohere": bool(COHERE_API_KEY),
+            "redis": bool(redis_client.ping()),
+            "auth": True
         }
     })
 

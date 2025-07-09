@@ -1,11 +1,12 @@
 flask==3.0.0
 flask-cors==4.0.0
 flask-limiter==3.3.0
+gunicorn==21.2.0
 python-dotenv==1.0.0
 requests==2.31.0
 tenacity==8.2.3
 pyjwt==2.8.0
 bcrypt==4.1.2
 redis==4.6.0
-gunicorn==21.2.0
 cohere==4.34
+gevent==22.10.2

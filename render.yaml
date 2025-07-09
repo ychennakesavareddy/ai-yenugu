@@ -2,34 +2,25 @@ services:
   - type: web
     name: ai-yenugu
     env: python
-    region: oregon  # Recommended for better performance
-    plan: free  # Or upgrade to starter/pro for better resources
-    pythonVersion: "3.11.6"  # Explicit version to prevent conflicts
-    
-    # Build configuration
+    region: oregon
+    plan: free
+    pythonVersion: "3.11.6"
     buildCommand: |
       pip install --upgrade pip
-      pip install wheel  # Required for some binary packages
-      pip install -r requirements-full.txt
-      
-    startCommand: gunicorn --workers=4 --timeout=120 --bind=0.0.0.0:10000 app:app
-    
-    # Environment variables
+      pip install -r requirements.txt
+      cd frontend && npm install && npm run build
+    startCommand: gunicorn --bind :$PORT --workers 4 --timeout 120 app:app
     envVars:
+      - key: PORT
+        value: 10000
       - key: FLASK_ENV
         value: production
-      - key: PYTHONUNBUFFERED
-        value: 1
       - key: COHERE_API_KEY
-        sync: false  # Set this in Render dashboard
-      - key: JWT_SECRET
-        generateValue: true  # Auto-generate a secure secret
+        sync: false
       - key: REDIS_URL
         fromDatabase:
           name: redis
           property: connectionString
-      - key: REQUIRE_BCRYPT
-        value: "true"  # Force bcrypt requirement check
 
 databases:
   - name: redis
